@@ -23,6 +23,7 @@ from kiro_crew import memory_record_metadata as record_meta
 from kiro_crew import memory_schema, memory_stores
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.execution_context import resolve_member_execution
+from kiro_crew.members import write_dm_binding
 from kiro_crew.memory import PREFERENCES_FILE, PROJECTS_FILE
 from kiro_crew.memory_stores import (
     LEGACY_MEMBER_MANIFEST,
@@ -175,6 +176,15 @@ class TestTheUpgradeRepairsAnAttributableStore:
             connection.close()
         assert meta["owner_member"] == "reviewer"
         assert meta[memory_schema.LINEAGE_META_KEY] == memory_schema.LINEAGE_CREW
+
+    def test_an_own_dm_binding_does_not_re_slug_the_member_during_upgrade(self) -> None:
+        _write_legacy_home("reviewer")
+        write_dm_binding("reviewer", member="reviewer", slot_key="member-reviewer")
+        cfg = KiroCrewConfig.load()
+
+        assert migrate_legacy_member_stores(cfg) == [STORE]
+        assert cfg.agents["reviewer"].member_id == "reviewer"
+        assert KiroCrewConfig.load().agents["reviewer"].member_id == "reviewer"
 
     def test_a_second_run_changes_nothing(self) -> None:
         directory = _write_legacy_home("reviewer")
