@@ -1817,11 +1817,20 @@ class VectorMemoryStore:
         snapshot: dict,
         messages: list[dict],
         facets: memory_schema.MemoryFacets | None = None,
+        admit: Callable[[], None] | None = None,
     ) -> dict:
         """Publish one extracted span, its provenance and retry receipt atomically.
 
         Embeddings remain NULL until the writer's maintenance sweep. No provider,
         transcript or filesystem operation takes place inside this transaction.
+
+        *admit*, when given, is called immediately before each mutation and once
+        more before the commit; it may raise. The consolidator hands in its
+        write gate's per-mutation check here (in-memory records only, so the
+        contract above holds): a session whose memory mode tightens while this
+        transaction runs raises out of the mutation it reached, the ``except``
+        below rolls the transaction back whole, and nothing partial is
+        committed.
         """
         if self.algorithm_version != "v2" or not source_id:
             raise ValueError("Consolidation requires a member database and stable source id")
@@ -1831,6 +1840,11 @@ class VectorMemoryStore:
         source_digest = consolidation_source_digest(messages)
         source = f"consolidation:{session_key}"
         receipt: dict = {"source_id": source_id, "semantic": 0, "episodic": 0, "lessons": 0}
+
+        def _admitted() -> None:
+            if admit is not None:
+                admit()
+
         with self._db_lock:
             self.db.execute("BEGIN IMMEDIATE")
             try:
@@ -1856,6 +1870,7 @@ class VectorMemoryStore:
                             "SELECT * FROM semantic_memory WHERE key=? AND is_deleted=0", (key,)
                         ).fetchone()
                         if before:
+                            _admitted()
                             record_meta.propose_conflict(
                                 self.db,
                                 kind="fact",
@@ -1885,6 +1900,7 @@ class VectorMemoryStore:
                         messages=messages,
                         session_key=session_key,
                     )
+                    _admitted()
                     rejection = self._write_semantic(
                         key,
                         json.dumps(value, ensure_ascii=False),
@@ -1928,6 +1944,7 @@ class VectorMemoryStore:
                     ).fetchone():
                         continue
                     item_id = str(uuid4())
+                    _admitted()
                     self.db.execute(
                         memory_schema.episodic_insert(self._lineage),
                         memory_schema.episodic_insert_params(
@@ -1999,6 +2016,7 @@ class VectorMemoryStore:
                         value["applies"] = applies
                     if self.validate_semantic(key, value, 0.9, source) is not None:
                         continue
+                    _admitted()
                     if not self._write_semantic(
                         key,
                         json.dumps(value, ensure_ascii=False),
@@ -2015,6 +2033,7 @@ class VectorMemoryStore:
                             )
                 entry = result.get("history_entry")
                 if isinstance(entry, str) and entry.strip():
+                    _admitted()
                     self._append_history(entry)
                 self.db.execute(
                     "INSERT INTO memory_consolidations VALUES (?,?,?,?,?,?)",
@@ -2027,6 +2046,9 @@ class VectorMemoryStore:
                         _now_iso(),
                     ),
                 )
+                # The last word before anything becomes durable: a mode that
+                # tightened during the mutations above rolls all of them back.
+                _admitted()
                 self.db.commit()
             except BaseException:
                 self.db.rollback()
@@ -2545,6 +2567,7 @@ class VectorMemoryStore:
         expected_revision: int | None = None,
         correction: record_meta.CorrectionEvidence | None = None,
         defer_embedding: bool = False,
+        admit: Callable[[], None] | None = None,
     ) -> tuple[SemanticRejectCode, str] | None:
         """Write a semantic memory entry with full validation pipeline.
 
@@ -2560,6 +2583,10 @@ class VectorMemoryStore:
         has measured this embedder to be slow and must stop paying that latency
         once per item. The row is keyword-searchable at once, and the state it
         persists is the state a FAILED embed already persists.
+
+        *admit* is the per-mutation check the consolidator's write gate hands in,
+        asked inside the write transaction immediately before the row lands and
+        before its commit (see :meth:`_write_semantic`); it may raise.
         """
         # Persist the raw UTF-8 dump (as memory_edit._json does for user
         # edits) so the size gate in validate_semantic measures exactly the
@@ -2594,6 +2621,7 @@ class VectorMemoryStore:
             expected_revision=expected_revision,
             correction=correction,
             defer_embedding=defer_embedding,
+            admit=admit,
         )
         if conflict is not None:
             logger.info("Semantic write rejected for %r: %s", key, conflict)
@@ -2879,6 +2907,7 @@ class VectorMemoryStore:
         correction: record_meta.CorrectionEvidence | None = None,
         _consolidation: bool = False,
         defer_embedding: bool = False,
+        admit: Callable[[], None] | None = None,
     ) -> str | None:
         """Retain V1 conflict scoring; propose inferred changes in private V2.
 
@@ -2887,12 +2916,26 @@ class VectorMemoryStore:
         — leaving each of them in the state it already reaches when the embedder
         answers ``None``: a NULL vector for the repair sweep, and a retirement
         that matches on text alone.
+
+        *admit*, when given, is called once the transaction is open -- after
+        every read and before the first mutation -- and once more before each
+        commit; it may raise, and a raise unwinds through the rollback below.
+        The consolidator's write gate hands in its per-mutation check: a session
+        whose memory mode tightens between the gate's admission at the verb and
+        the row landing here (``write_lesson`` embeds, seconds, before it reaches
+        this method) is refused at the row, not after it.
         """
         private_policy = self.algorithm_version == "v2"
+
+        def _admitted() -> None:
+            if admit is not None:
+                admit()
+
         with self._db_lock:
             if not _consolidation:
                 self.db.execute("BEGIN IMMEDIATE")
             try:
+                _admitted()
                 existing = self.db.execute(
                     "SELECT * FROM semantic_memory WHERE key = ?", (key,)
                 ).fetchone()
@@ -2985,6 +3028,7 @@ class VectorMemoryStore:
                         metadata=metadata,
                     )
                     if not _consolidation:
+                        _admitted()
                         self.db.commit()
                     if not _consolidation:
                         self._log_event(
@@ -3003,6 +3047,7 @@ class VectorMemoryStore:
                             kind, key, before, source, metadata=metadata, operation="observe"
                         )
                     if not _consolidation:
+                        _admitted()
                         self.db.commit()
                     return None
                 now = _now_iso()
@@ -3040,6 +3085,7 @@ class VectorMemoryStore:
                         ),
                     )
                 if not _consolidation:
+                    _admitted()
                     self.db.commit()
             except (ValueError, sqlite3.IntegrityError) as exc:
                 if _consolidation:
@@ -3879,6 +3925,7 @@ class VectorMemoryStore:
         defer_embedding: bool = False,
         facets: "memory_schema.MemoryFacets | None" = None,
         metadata: dict | None = None,
+        admit: Callable[[], None] | None = None,
     ) -> bool:
         """Write an episodic memory with optional embedding and dedup.
 
@@ -3902,8 +3949,20 @@ class VectorMemoryStore:
         callers that schedule that sweep — a row left NULL forever is silently
         absent from vector search. Deferral also skips the similarity dedup
         (which needs a vector), so the caller keeps its own duplicate check.
+
+        *admit*, when given, is called once the write transaction is open --
+        after the blocking embed above it and every dedup read -- and once more
+        before the commit; it may raise, and a raise unwinds through the
+        transaction's own rollback. The consolidator's write gate hands in its
+        per-mutation check so an episode whose embedding outlived a mode change
+        is refused at the row.
         """
         text = text.strip()
+
+        def _admitted() -> None:
+            if admit is not None:
+                admit()
+
         metadata = record_meta.normalize_metadata(metadata) if metadata is not None else None
         if facets and facets.derived_from:
             metadata = {**(metadata or {}), "source_ref": facets.derived_from}
@@ -4080,6 +4139,7 @@ class VectorMemoryStore:
                 now = _now_iso()
                 self.db.execute("BEGIN IMMEDIATE")
                 try:
+                    _admitted()
                     if not self._embedding_current(embedding):
                         embedding_blob = None
                     active_count = self.db.execute(
@@ -4105,16 +4165,26 @@ class VectorMemoryStore:
                     self._record_mutation(
                         "episode", mem_id, None, source, metadata=metadata, operation="create"
                     )
+                    _admitted()
                     self.db.commit()
                 except Exception:
                     self.db.rollback()
                     raise
             else:
-                self._enforce_episodic_cap()
                 mem_id = str(uuid4())
                 now = _now_iso()
                 with self.db:
                     self.db.execute("BEGIN IMMEDIATE")
+                    _admitted()
+                    # The V1 cap eviction is a mutation of THIS write, so it lands in
+                    # this transaction: admitted above with the row, evicting before
+                    # the insert, committed with it -- a refusal or any failure rolls
+                    # the tombstones back together with the row and the store is
+                    # byte-identical. Ahead of the transaction (its old place) the
+                    # eviction had already committed when the admission hook refused
+                    # the row it made room for: an existing episode gone for a row
+                    # that never landed.
+                    self._evict_for_episodic_cap()
                     if not self._embedding_current(embedding):
                         embedding_blob = None
                     self.db.execute(
@@ -4134,6 +4204,7 @@ class VectorMemoryStore:
                     self._record_mutation(
                         "episode", mem_id, None, source, metadata=metadata, operation="create"
                     )
+                    _admitted()
                     self.db.commit()
 
             # Add to FAISS. The C++ index and the Python _faiss_id_map MUST commit
@@ -5215,8 +5286,17 @@ class VectorMemoryStore:
             self.db.commit()
             self._invalidate_episodic_scoring()
 
-    def _enforce_episodic_cap(self) -> None:
-        """Enforce the legacy V1 cap; private V2 memory is retained until corrected or forgotten."""
+    def _evict_for_episodic_cap(self) -> None:
+        """Make room under the legacy V1 cap, INSIDE the caller's write transaction.
+
+        Called by ``write_episodic`` with ``_db_lock`` held and ``BEGIN IMMEDIATE``
+        open, after the write's admission and before its insert: the tombstones
+        it writes commit with the row or roll back with it, and it commits
+        nothing itself (the caller invalidates the scoring cache after its
+        commit). The lock is re-entrant, so taking it here is the module's
+        statement-level guard, not a second serialization point. Private V2
+        memory is retained until corrected or forgotten.
+        """
         if self.algorithm_version == "v2":
             return
         with self._db_lock:
@@ -5239,8 +5319,6 @@ class VectorMemoryStore:
                 self._record_mutation(
                     "episode", row["id"], dict(row), "capacity", operation="forget"
                 )
-            self.db.commit()
-            self._invalidate_episodic_scoring()
 
     # ── Lessons ──
 
@@ -5256,6 +5334,7 @@ class VectorMemoryStore:
         *,
         applies: str | None = None,
         facets: "memory_schema.MemoryFacets | None" = None,
+        admit: Callable[[], None] | None = None,
     ) -> LessonWriteResult:
         """Write a lesson as a semantic entry with key lesson.<hash>.
 
@@ -5996,7 +6075,14 @@ class VectorMemoryStore:
                 facets if facets is not None else memory_schema.MemoryFacets()
             )
             facets = dataclasses.replace(prior, scope=repo_scope)
-        err = self.set_semantic(key, value, confidence, source, facets=facets)
+        # Every embedding of this call has run by here (the rule's own, the dedup
+        # scan's). *admit* rides into the write transaction and is asked again
+        # immediately before the row lands and before its commit, so a mode that
+        # tightened during those embeddings refuses the lesson AT the row. The
+        # supersede tombstones and the vector update below run only once the row
+        # stands and add no content of the conversation's: tombstoning the rows
+        # this one replaces and attaching the vector of a row already written.
+        err = self.set_semantic(key, value, confidence, source, facets=facets, admit=admit)
         if err is not None:
             # Nothing was deleted: the scan only QUEUED its supersedes, and the
             # queue drains below this return. So a value the store rejects costs
