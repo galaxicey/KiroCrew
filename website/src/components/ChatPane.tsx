@@ -480,6 +480,14 @@ export default function ChatPane({
   // setInput directly, not this handler, so they are unaffected.
   const handleUserInput = useCallback((next: string | ((prev: string) => string)) => {
     followUpInsertedRef.current = null
+    // The mirror is synced HERE, not only in render: the slot-rebind layout
+    // effect below parks the outgoing draft from `inputRef.current`, and a CHILD
+    // layout effect of the same commit may have just changed the composer -- the
+    // voice atom takes an abandoned dictation back out of the draft it is
+    // leaving behind. A value still queued as state would be parked as its
+    // pre-change self, so the discarded speech would come back on return with
+    // the words it spoke over still missing.
+    inputRef.current = typeof next === 'function' ? next(inputRef.current) : next
     setInput(next)
   }, [])
   // Orchestrator plan dispatch (#5893) — same mutation ChatPage uses,

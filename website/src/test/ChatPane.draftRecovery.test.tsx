@@ -11,6 +11,9 @@ import chatReducer, { selectSlotMessages, setActiveSlot, sseChatMessage } from '
 import type { SendReceipt, SendTurnOptions } from '../chat-core/transport/sendTurn'
 import { queuedSendStash } from '../hooks/useQueuedMessageActions'
 import { __resetPaneDraftsForTests } from '../utils/chatPaneDrafts'
+import { readFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import dashboardReducer from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
 
@@ -248,6 +251,32 @@ describe('ChatPane draft & recovery hardening (steer-only DM thread)', () => {
     await waitFor(() => expect((box as HTMLTextAreaElement).value).toBe('half-typed note for A'))
     rebind('member-b')
     await waitFor(() => expect((box as HTMLTextAreaElement).value).toBe('something for B'))
+  })
+
+  // The park above reads `inputRef.current` inside a LAYOUT effect, so it sees a
+  // child's change of the composer in that same commit only if the change handler
+  // synced the mirror as it set the state -- the voice atom takes an abandoned
+  // dictation back out of the draft it is leaving behind from a child layout
+  // effect. A queued value would be parked as its pre-change self and the speech
+  // would come back on return, minus the words it spoke over. Behaviourally
+  // unreachable from here (this file has no speech engine), and deliberately
+  // brittle like the sibling guard in ChatPageDrafts: if the handler is
+  // reformatted, UPDATE the substring -- never delete the guard.
+  it('syncs the composer mirror in the change handler, before the queued state update', () => {
+    const here = dirname(fileURLToPath(import.meta.url))
+    const src = readFileSync(resolve(here, '../components/ChatPane.tsx'), 'utf8')
+    const eager = src.indexOf("inputRef.current = typeof next === 'function' ? next(inputRef.current) : next")
+    expect(
+      eager,
+      'ChatPane handleUserInput must write inputRef.current before setInput, or the slot-rebind '
+      + 'layout effect parks the outgoing draft as its pre-change value',
+    ).toBeGreaterThan(-1)
+    // The guard is only worth anything while the park it protects still reads that
+    // mirror, so assert the park site too rather than let a rename hollow it out.
+    expect(
+      src.indexOf('writePaneDraft(prev, { text: inputRef.current'),
+      'the layout-effect park this guard protects is gone -- re-derive the guard, do not drop it',
+    ).toBeGreaterThan(-1)
   })
 
   it('a refusal that lands after the user switched members restores into the SENDING member, not the one on screen', async () => {

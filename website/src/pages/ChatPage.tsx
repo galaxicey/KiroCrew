@@ -7551,7 +7551,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 ref={composerRef}
                 slotKey={activeSlot}
                 value={input}
-                onChange={v => { clearFollowUpOwnership(); setInput(v) }}
+                // The mirror is synced HERE, not only in the effect keyed on `input`:
+                // the outgoing-slot persist below reads `inputRef.current` during the
+                // same effect flush in which a child may have just changed the
+                // composer, and a value that is still queued as state would be
+                // persisted as its pre-change self. `voiceDeliverOffScreen` carries the
+                // same guard by hand for the cross-slot case.
+                onChange={v => { clearFollowUpOwnership(); inputRef.current = v; setInput(v) }}
                 voice={composerVoiceOptions}
               >
               <ChatInput
