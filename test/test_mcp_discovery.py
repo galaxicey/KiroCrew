@@ -16,8 +16,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from conftest import host_abs
-from kiro_crew import platform_compat
+from kiro_crew import mcp_discovery, platform_compat
 from kiro_crew.mcp_discovery import (
+    _MAX_HINT_NAME_LEN,
+    _MAX_HINTS,
+    _PROBE_TTL_SECS,
     MCP_REDACTED_HEADER_VALUE,
     SCOPE_CC_GLOBAL,
     SCOPE_KIRO_GLOBAL,
@@ -30,12 +33,14 @@ from kiro_crew.mcp_discovery import (
     _probe_cache,
     _probe_remote,
     _read_jsonrpc_response,
+    _read_only_hints,
     _read_stdio_jsonrpc_response,
     _scope_priority,
     discover_servers_to_sync,
     list_servers,
     probe_metadata,
     probe_server,
+    probed_tool_read_only,
     sync_to_agent_config,
 )
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
@@ -5527,3 +5532,275 @@ class TestQuarantinedServersAreNotSpawned:
             await self._pass(monkeypatch, spawned)
 
         assert spawned == ["wedged"] * (self.LIMIT + 2)
+
+
+class TestToolReadOnlyHints:
+    """The name-keyed ``readOnlyHint`` map, and the one reader of it.
+
+    ``tool_annotations`` cannot answer "is THIS tool read-only" -- it is a bare
+    list with the names dropped, so entry N is not provably tool N. These pin
+    the keyed map that can, and the rule that makes it safe to build anything
+    on: a server that said nothing yields NO key, never ``False``.
+    """
+
+    def setup_method(self) -> None:
+        _probe_cache.clear()
+
+    def teardown_method(self) -> None:
+        _probe_cache.clear()
+
+    def test_declared_hint_is_keyed_by_tool_name(self) -> None:
+        hints = _read_only_hints(
+            [
+                {"name": "search", "annotations": {"readOnlyHint": True}},
+                {"name": "delete", "annotations": {"readOnlyHint": False}},
+            ]
+        )
+        assert hints == {"search": True, "delete": False}
+
+    def test_silence_produces_no_key_rather_than_false(self) -> None:
+        """The load-bearing rule. A missing annotation, a missing hint, a
+        non-boolean hint and a nameless tool are all "no claim" -- and a
+        consumer must be unable to read any of them as a verdict."""
+        hints = _read_only_hints(
+            [
+                {"name": "no_annotations"},
+                {"name": "empty_annotations", "annotations": {}},
+                {"name": "string_hint", "annotations": {"readOnlyHint": "true"}},
+                {"name": "null_hint", "annotations": {"readOnlyHint": None}},
+                {"name": "", "annotations": {"readOnlyHint": True}},
+                "not-a-dict",
+                {"name": "ok", "annotations": {"readOnlyHint": True}},
+            ]
+        )
+        assert hints == {"ok": True}
+
+    def test_failed_probe_keeps_the_prior_map(self) -> None:
+        """Same preservation rule the tool list and annotations already get: a
+        transient timeout must not erase a healthy server's declared hints."""
+        good = McpServerInfo(
+            name="flaky",
+            command="x",
+            status="ok",
+            tools=["search"],
+            tool_read_only={"search": True},
+        )
+        _cache_probe(good)
+        _cache_probe(McpServerInfo(name="flaky", command="x", status="error", error="timeout"))
+
+        meta = probe_metadata("flaky")
+        assert meta is not None
+        assert meta.tool_read_only == {"search": True}
+        # ...but a failed probe is not an answer to ask a grant on.
+        assert probed_tool_read_only("flaky", "search") is None
+
+    def test_reader_answers_only_a_fresh_successful_probe(self) -> None:
+        _cache_probe(
+            McpServerInfo(
+                name="srv",
+                command="x",
+                status="ok",
+                tools=["search", "write", "quiet"],
+                tool_read_only={"search": True, "write": False},
+            )
+        )
+        assert probed_tool_read_only("srv", "search") is True
+        assert probed_tool_read_only("srv", "write") is False
+        # Declared nothing about it.
+        assert probed_tool_read_only("srv", "quiet") is None
+        # Never probed / not named at all.
+        assert probed_tool_read_only("other", "search") is None
+        assert probed_tool_read_only("", "search") is None
+        assert probed_tool_read_only("srv", "") is None
+
+    def test_reader_forgets_a_claim_older_than_the_ttl(self) -> None:
+        """An expired claim describes a server spawn that may since have been
+        replaced, so it stops being an answer -- it does not become ``False``."""
+        _cache_probe(
+            McpServerInfo(
+                name="srv",
+                command="x",
+                status="ok",
+                tools=["search"],
+                tool_read_only={"search": True},
+            )
+        )
+        assert probed_tool_read_only("srv", "search") is True
+        cached = _probe_cache["srv"]
+        cached.probed_at -= _PROBE_TTL_SECS + 1
+        assert probed_tool_read_only("srv", "search") is None
+
+    @pytest.mark.asyncio
+    async def test_remote_probe_collects_the_hints_too(self) -> None:
+        """A hint must not depend on the transport the server is reached over."""
+        server = McpServerInfo(name="remote", url="https://example.com/mcp")
+
+        init_resp = MagicMock()
+        init_resp.status = 200
+        init_resp.content_type = "application/json"
+        init_resp.headers = {}
+        init_resp.json = AsyncMock(return_value={"jsonrpc": "2.0", "id": 1, "result": {}})
+        init_resp.__aenter__ = AsyncMock(return_value=init_resp)
+        init_resp.__aexit__ = AsyncMock(return_value=False)
+
+        notif_resp = MagicMock()
+        notif_resp.status = 202
+        notif_resp.__aenter__ = AsyncMock(return_value=notif_resp)
+        notif_resp.__aexit__ = AsyncMock(return_value=False)
+
+        tools_resp = MagicMock()
+        tools_resp.status = 200
+        tools_resp.content_type = "application/json"
+        tools_resp.json = AsyncMock(
+            return_value={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "tools": [
+                        {"name": "search", "annotations": {"readOnlyHint": True}},
+                        {"name": "write"},
+                    ]
+                },
+            }
+        )
+        tools_resp.__aenter__ = AsyncMock(return_value=tools_resp)
+        tools_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(side_effect=[init_resp, notif_resp, tools_resp])
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("kiro_crew.mcp_discovery.aiohttp.ClientSession", return_value=mock_session):
+            result = await _probe_remote(server)
+
+        assert result.status == "ok"
+        assert result.tool_read_only == {"search": True}
+
+    def test_an_unhashable_tool_name_is_skipped_not_raised(self) -> None:
+        """A list-valued ``name`` is unhashable. Building a dict key from it
+        raises inside the probe's own ``except Exception``, so the server would
+        be cached as an ERROR reading "unhashable type: 'list'" for the whole
+        TTL -- red-badging a server whose tool list parsed fine."""
+        hints = _read_only_hints(
+            [
+                {"name": ["a"], "annotations": {"readOnlyHint": True}},
+                {"name": {"k": "v"}, "annotations": {"readOnlyHint": True}},
+                {"name": 123, "annotations": {"readOnlyHint": True}},
+                {"name": "real", "annotations": {"readOnlyHint": True}},
+            ]
+        )
+        assert hints == {"real": True}
+
+    def test_the_map_is_bounded_in_both_count_and_name_length(self) -> None:
+        """Every key is server-chosen and retained for the probe TTL, so a
+        bounded count of an unbounded name would still be unbounded."""
+        long_name = "x" * (_MAX_HINT_NAME_LEN + 1)
+        hints = _read_only_hints(
+            [
+                {"name": long_name, "annotations": {"readOnlyHint": True}},
+                {"name": "short", "annotations": {"readOnlyHint": True}},
+            ]
+        )
+        assert hints == {"short": True}
+
+        flood = [
+            {"name": f"t{i}", "annotations": {"readOnlyHint": True}} for i in range(_MAX_HINTS + 50)
+        ]
+        assert len(_read_only_hints(flood)) == _MAX_HINTS
+
+    def test_a_dropped_hint_is_recorded(self, caplog) -> None:
+        """Dropping is only acceptable because it is visible and because the
+        dropped tool then prompts rather than being auto-approved."""
+        with caplog.at_level(logging.WARNING):
+            hints = _read_only_hints(
+                [{"name": "y" * (_MAX_HINT_NAME_LEN + 1), "annotations": {"readOnlyHint": True}}]
+            )
+        assert hints == {}
+        assert "dropped 1 read-only hint(s) over the retention budget" in caplog.text
+
+    def test_a_project_server_sharing_a_name_never_inherits_the_hint(self, tmp_path) -> None:
+        """The cache is keyed by bare name, and a name is not an identity. A
+        project checkout's own agent file may declare ``mcpServers`` under a
+        globally-probed name, and those names are dispatchable -- so without the
+        fingerprint its MUTATING tool would ride the probed server's read hint."""
+        mcp_discovery._cache_probe(
+            McpServerInfo(
+                name="docs",
+                command="/usr/bin/global-docs",
+                status="ok",
+                tools=["search"],
+                tool_read_only={"search": True},
+            )
+        )
+        # No project in play: the probed entry is unambiguous and answers.
+        assert probed_tool_read_only("docs", "search") is True
+
+        agents = tmp_path / ".kiro" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "myagent.json").write_text(
+            json.dumps({"mcpServers": {"docs": {"command": "/opt/project-docs"}}}),
+            encoding="utf-8",
+        )
+        assert (
+            probed_tool_read_only("docs", "search", agent="myagent", project_dir=str(tmp_path))
+            is None
+        )
+
+    def test_a_project_spec_identical_to_the_probed_one_still_answers(self, tmp_path) -> None:
+        """The gate is identity, not the mere presence of a project spec."""
+        mcp_discovery._cache_probe(
+            McpServerInfo(
+                name="docs",
+                command="/usr/bin/global-docs",
+                args=["--stdio"],
+                status="ok",
+                tools=["search"],
+                tool_read_only={"search": True},
+            )
+        )
+        agents = tmp_path / ".kiro" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "myagent.json").write_text(
+            json.dumps(
+                {"mcpServers": {"docs": {"command": "/usr/bin/global-docs", "args": ["--stdio"]}}}
+            ),
+            encoding="utf-8",
+        )
+        assert (
+            probed_tool_read_only("docs", "search", agent="myagent", project_dir=str(tmp_path))
+            is True
+        )
+
+    def test_an_unparseable_project_spec_reads_as_declared(self, tmp_path) -> None:
+        """A file we cannot parse is not agreement."""
+        mcp_discovery._cache_probe(
+            McpServerInfo(
+                name="docs",
+                command="/usr/bin/global-docs",
+                status="ok",
+                tools=["search"],
+                tool_read_only={"search": True},
+            )
+        )
+        agents = tmp_path / ".kiro" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "myagent.json").write_text("{ not json", encoding="utf-8")
+        assert (
+            probed_tool_read_only("docs", "search", agent="myagent", project_dir=str(tmp_path))
+            is None
+        )
+
+    def test_a_cache_entry_with_no_fingerprint_answers_nothing(self) -> None:
+        """A pre-fingerprint entry cannot prove which server it describes."""
+        mcp_discovery._cache_probe(
+            McpServerInfo(
+                name="docs",
+                command="/usr/bin/global-docs",
+                status="ok",
+                tools=["search"],
+                tool_read_only={"search": True},
+            )
+        )
+        mcp_discovery._probe_cache["docs"].spec_fingerprint = ""
+        assert probed_tool_read_only("docs", "search") is None
