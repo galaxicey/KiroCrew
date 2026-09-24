@@ -982,9 +982,15 @@ class TelegramClient:
             params["text"] = text[:200]
         await self._api("answerCallbackQuery", params)
 
-    async def delete_message(self, chat_id: int, message_id: int) -> None:
-        """Delete a message (e.g. remove stale inline keyboards)."""
-        await self._api("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+    async def delete_message(self, chat_id: int, message_id: int) -> bool:
+        """Delete a message (e.g. remove stale inline keyboards). Confirms the removal.
+
+        The answer matters to a caller that keeps state about what is ON SCREEN: a
+        refused delete leaves the message there, and treating it as gone names the
+        wrong message as the one above whatever is sent next.
+        """
+        params = {"chat_id": chat_id, "message_id": message_id}
+        return await self._api("deleteMessage", params) is not None
 
     async def set_message_reaction(self, chat_id: int, message_id: int, emoji: str) -> bool:
         """Set a single emoji reaction on a message (Bot API 7.0+ ``setMessageReaction``).

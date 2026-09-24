@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import html
 import threading
 import time
 from contextlib import contextmanager
@@ -25,12 +26,13 @@ from kiro_crew.acp.client import AcpError
 from kiro_crew.acp.types import EVENT_COMPACTION_STATUS, EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.dashboard.token_auth import parse_duration
 from kiro_crew.messaging.commands import parse_dashboard_ttl
-from kiro_crew.messaging.display_safety import joins_to_a_credential
+from kiro_crew.messaging.display_safety import CREDENTIAL_SEAM_TAG, joins_to_a_credential
 from kiro_crew.messaging.link import (
     UNBIND_REASON_UNSPECIFIED,
     ChannelLink,
     legacy_dashboard_mirror_key,
 )
+from kiro_crew.messaging.outbound_files import OutboundFile
 from kiro_crew.messaging.renderer import (
     DONE,
     STEER_CONSUMED,
@@ -66,6 +68,7 @@ from kiro_crew.telegram.commands import (
     parse_mid_turn_override,
 )
 from kiro_crew.telegram.renderer import (
+    _TEXTLESS_SEND,
     TelegramApprovalDecider,
     TelegramRenderer,
     _extract_options,
@@ -80,6 +83,7 @@ from kiro_crew.telegram.renderer import (
     _split_markdown_table_aware,
     _split_table_rows,
     _strip_steering,
+    _utf16_len,
     build_inline_keyboard,
 )
 from kiro_crew.telegram.transport import (
@@ -209,6 +213,8 @@ class FakeClient:
         self.rich_silent: list[bool] = []
         #: message_ids passed to deleteMessage.
         self.deleted: list[int] = []
+        #: When False, deleteMessage reports a refusal, so the message is still there.
+        self.delete_ok = True
         #: When True, send_rich_message reports failure (server lacks the API).
         self.rich_fails = False
         #: (files, thread, silent) per multipart upload call.
@@ -315,8 +321,9 @@ class FakeClient:
         self.reply_targets.append(reply_to_message_id)
         return self._mid
 
-    async def delete_message(self, chat_id: int, message_id: int) -> None:
+    async def delete_message(self, chat_id: int, message_id: int) -> bool:
         self.deleted.append(message_id)
+        return self.delete_ok
 
     async def set_message_reaction(self, chat_id: int, message_id: int, emoji: str) -> None:
         self.reactions.append((message_id, emoji))
@@ -1921,6 +1928,339 @@ class TestRenderer:
             screen[-2], screen[-1], _default_redactor
         ), f"the reader can rejoin a key across {screen[-2]!r} and {screen[-1]!r}"
 
+    def test_a_failed_finalization_leaves_the_visible_tail_as_the_frozen_text(self) -> None:
+        """A seal that never landed puts nothing on screen.
+
+        The streamed bubble keeps showing its last live frame, so THAT is what a
+        reader has above the next message. Recording the seal's own text before the
+        send would promote a phantom, and the phantom is not a superset of the
+        visible tail -- grading the next message against it is not the careful
+        direction.
+        """
+        head_half = "AKIAIOSF"
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            r._buf = [f"live frame {head_half}"]
+            await r._stream_live(force=True)
+            assert r._stream_mid is not None, "precondition: a bubble streamed"
+            assert r._landed_text == f"live frame {head_half}", r._landed_text
+
+            # Every edit and both sends fail, so the seal lands nothing and the
+            # bubble above still shows the live frame.
+            async def _no_edit(*a: Any, **kw: Any) -> bool:
+                return False
+
+            async def _no_send(*a: Any, **kw: Any) -> None:
+                return None
+
+            r._buf = ["a finalization that never arrives"]
+            original_edit, original_send = cli.edit_message, cli.send_message
+            cli.edit_message, cli.send_message = _no_edit, _no_send  # type: ignore[method-assign]
+            try:
+                await r._seal_current()
+            finally:
+                cli.edit_message, cli.send_message = (  # type: ignore[method-assign]
+                    original_edit,
+                    original_send,
+                )
+
+        asyncio.run(_go())
+
+        assert r._landed_text == f"live frame {head_half}", r._landed_text
+        r._open_new_message()
+        assert r._frozen_above == f"live frame {head_half}", r._frozen_above
+
+    def test_a_refused_live_edit_does_not_replace_the_visible_tail(self) -> None:
+        """A live frame the API refused is on no screen.
+
+        The bubble keeps showing the last frame that DID land, so that is the text
+        the next message's seam has to be graded against. Recording the refused
+        attempt swaps the real visible tail for one nobody saw, and when the real
+        tail ends mid-key the next message completes it unchallenged.
+        """
+        head_half, tail_half = "AKIAIOSF", "ODNN7EXAMPLE"
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            # Frame one lands, and its tail is the key's first half.
+            r._buf = [f"first frame {head_half}"]
+            await r._stream_live(force=True)
+            assert r._stream_mid is not None, "precondition: a bubble streamed"
+            assert r._landed_text == f"first frame {head_half}", r._landed_text
+
+            # Frame two is refused, so the bubble still holds frame one.
+            async def _no_edit(*a: Any, **kw: Any) -> bool:
+                return False
+
+            original_edit = cli.edit_message
+            cli.edit_message = _no_edit  # type: ignore[method-assign]
+            try:
+                r._buf = ["a later frame the API refused"]
+                await r._stream_live(force=True)
+            finally:
+                cli.edit_message = original_edit  # type: ignore[method-assign]
+
+            assert r._landed_text == f"first frame {head_half}", r._landed_text
+
+            # So the next message is graded against what the reader can read.
+            r._open_new_message()
+            assert r._frozen_above == f"first frame {head_half}", r._frozen_above
+            r._buf = [f"{tail_half} and the rest"]
+            await r._seal_current()
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) == 2, screen
+        for message in screen:
+            assert _default_redactor(message) == message, f"redacted alone: {message}"
+        assert not joins_to_a_credential(
+            screen[-2], screen[-1], _default_redactor
+        ), f"the reader can rejoin a key across {screen[-2]!r} and {screen[-1]!r}"
+
+    def test_a_live_send_that_returned_no_id_records_nothing(self) -> None:
+        head_half = "AKIAIOSF"
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            r._buf = [f"landed {head_half}"]
+            await r._seal_current()
+            r._open_new_message()
+            assert r._frozen_above == f"landed {head_half}", r._frozen_above
+
+            # No id back means no message exists, so this frame is on no screen.
+            async def _no_send(*a: Any, **kw: Any) -> None:
+                return None
+
+            original_send = cli.send_message
+            cli.send_message = _no_send  # type: ignore[method-assign]
+            try:
+                r._buf = ["a live frame that never arrived"]
+                await r._stream_live(force=True)
+            finally:
+                cli.send_message = original_send  # type: ignore[method-assign]
+
+            assert r._stream_mid is None, r._stream_mid
+            assert r._landed_text == "", r._landed_text
+
+        asyncio.run(_go())
+
+        r._open_new_message()
+        assert r._frozen_above == f"landed {head_half}", r._frozen_above
+
+    def test_each_shipped_chunk_is_graded_against_what_is_frozen_above_it(self) -> None:
+        """An overflowing degraded segment ships leading chunks itself.
+
+        The caller grades the whole segment once, which only fixes the head of the
+        first chunk. Every chunk it ships is its own message, so each one has to be
+        graded immediately before its own send.
+        """
+        head_half, tail_half = "AKIAIOSF", "ODNN7EXAMPLE"
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            # A frozen message whose tail is the key's first half.
+            r._buf = [f"first message {head_half}"]
+            await r._seal_current()
+            r._open_new_message()
+            assert r._frozen_above == f"first message {head_half}", r._frozen_above
+
+            # The SHIPPED chunk opens with the key's other half, so it is the one
+            # that has to be withheld against the frozen message.
+            r._degraded_table_chunks = lambda text: [  # type: ignore[method-assign]
+                f"{tail_half} opens the shipped chunk",
+                "the tail chunk is harmless prose",
+            ]
+            # Force the degraded path: both rendered forms must exceed the limit.
+            r._rendered_limit = lambda: 1  # type: ignore[method-assign]
+            r._buf = ["anything, the chunking is stubbed"]
+            await r._seal_current()
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) >= 2, screen
+        for above, below in zip(screen, screen[1:]):
+            assert not joins_to_a_credential(
+                above, below, _default_redactor
+            ), f"the reader can rejoin a key across {above!r} and {below!r}"
+        # And a seam withheld on a shipped chunk is counted, so the turn's notice
+        # reports it rather than leaving a silent gap.
+        assert any(CREDENTIAL_SEAM_TAG in t for t in screen), "precondition: the seam opened"
+        assert r._redacted_creds > 0, r._redacted_creds
+
+    def test_a_fallback_send_after_a_failed_edit_is_graded_against_the_bubble(self) -> None:
+        """A refused edit does not remove the bubble, so the send lands UNDER it.
+
+        ``edit_message`` reports any API failure falsily -- a chat out of edit budget
+        included -- not only a bubble that is really gone, so the streamed frame is
+        plausibly still the bottom message and it is what the fallback send has to be
+        safe beside.
+        """
+        head_half, tail_half = "AKIAIOSF", "ODNN7EXAMPLE"
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            # A live frame ending with the key's first half, confirmed on screen,
+            # with nothing frozen above it -- so grading against the frozen text
+            # alone would withhold nothing at all.
+            r._buf = [f"live frame {head_half}"]
+            await r._stream_live(force=True)
+            assert r._landed_text == f"live frame {head_half}", r._landed_text
+            assert r._frozen_above == "", r._frozen_above
+
+            # Every edit is refused, so the seal falls through to a fresh send that
+            # lands under the frame above.
+            async def _no_edit(*a: Any, **kw: Any) -> bool:
+                return False
+
+            original_edit = cli.edit_message
+            cli.edit_message = _no_edit  # type: ignore[method-assign]
+            try:
+                r._buf = [f"{tail_half} and the rest"]
+                await r._seal_current()
+            finally:
+                cli.edit_message = original_edit  # type: ignore[method-assign]
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) >= 2, screen
+        assert not joins_to_a_credential(
+            screen[0], screen[-1], _default_redactor
+        ), f"the reader can rejoin a key across {screen[0]!r} and {screen[-1]!r}"
+
+    def test_a_shipped_chunk_under_a_live_frame_is_graded_against_that_frame(self) -> None:
+        """A shipped chunk placed below a surviving live frame is graded against it.
+
+        With a bubble already on screen the first shipped chunk tries an EDIT, and a
+        refused edit leaves that bubble standing -- so the send that follows lands
+        below the live frame, not below the message above it. Nothing is frozen above
+        here, so grading against the frozen text alone withholds nothing.
+        """
+        head_half, tail_half = "AKIAIOSF", "ODNN7EXAMPLE"
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            r._buf = [f"live frame {head_half}"]
+            await r._stream_live(force=True)
+            assert r._landed_text == f"live frame {head_half}", r._landed_text
+            assert r._stream_mid is not None, "precondition: a bubble streamed"
+            assert r._frozen_above == "", r._frozen_above
+
+            r._degraded_table_chunks = lambda text: [  # type: ignore[method-assign]
+                f"{tail_half} opens the shipped chunk",
+                "the tail chunk is harmless prose",
+            ]
+            r._rendered_limit = lambda: 1  # type: ignore[method-assign]
+
+            # Every edit is refused, so the bubble survives and the shipped chunk
+            # becomes a fresh send placed under it.
+            async def _no_edit(*a: Any, **kw: Any) -> bool:
+                return False
+
+            original_edit = cli.edit_message
+            cli.edit_message = _no_edit  # type: ignore[method-assign]
+            try:
+                r._buf = ["anything, the chunking is stubbed"]
+                await r._seal_current()
+            finally:
+                cli.edit_message = original_edit  # type: ignore[method-assign]
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) >= 2, screen
+        assert not joins_to_a_credential(
+            f"live frame {head_half}", screen[1], _default_redactor
+        ), f"the reader can rejoin a key across the live frame and {screen[1]!r}"
+
+    def test_a_middle_shipped_chunk_counts_its_own_withheld_seam(self) -> None:
+        """Only the shipped chunk is withheld here, so only its own tally can count.
+
+        The tail chunk is sealed by the caller, which tallies on its own delivery
+        branches -- so a case where the tail is withheld proves nothing about the
+        shipped ones. With three chunks and the danger between the first and the
+        second, the withholding happens on a chunk the caller never sees.
+        """
+        head_half, tail_half = "AKIAIOSF", "ODNN7EXAMPLE"
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            r._buf = ["first message, entirely harmless"]
+            await r._seal_current()
+            r._open_new_message()
+            assert r._redacted_creds == 0, r._redacted_creds
+
+            r._degraded_table_chunks = lambda text: [  # type: ignore[method-assign]
+                f"shipped chunk one ends {head_half}",
+                f"{tail_half} opens shipped chunk two",
+                "the tail chunk is harmless prose",
+            ]
+            r._rendered_limit = lambda: 1  # type: ignore[method-assign]
+            r._buf = ["anything, the chunking is stubbed"]
+            await r._seal_current()
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) >= 3, screen
+        assert any(
+            CREDENTIAL_SEAM_TAG in t for t in screen
+        ), "precondition: the seam opened on a shipped chunk"
+        assert r._redacted_creds > 0, r._redacted_creds
+        for above, below in zip(screen, screen[1:]):
+            assert not joins_to_a_credential(
+                above, below, _default_redactor
+            ), f"the reader can rejoin a key across {above!r} and {below!r}"
+
+    def test_a_shipped_chunk_becomes_the_text_the_next_one_is_graded_against(self) -> None:
+        """A chunk that landed IS what the reader has above the next one.
+
+        The frozen text here is harmless, so nothing is withheld against it. The
+        danger is entirely between the shipped chunk and the tail that follows it,
+        which is only visible if the shipped chunk became the frozen text.
+        """
+        head_half, tail_half = "AKIAIOSF", "ODNN7EXAMPLE"
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            r._buf = ["first message, entirely harmless"]
+            await r._seal_current()
+            r._open_new_message()
+            assert r._frozen_above == "first message, entirely harmless", r._frozen_above
+
+            # The shipped chunk ENDS mid-key and the tail opens with the other half.
+            r._degraded_table_chunks = lambda text: [  # type: ignore[method-assign]
+                f"the shipped chunk ends {head_half}",
+                f"{tail_half} opens the tail chunk",
+            ]
+            r._rendered_limit = lambda: 1  # type: ignore[method-assign]
+            r._buf = ["anything, the chunking is stubbed"]
+            await r._seal_current()
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) >= 2, screen
+        for above, below in zip(screen, screen[1:]):
+            assert not joins_to_a_credential(
+                above, below, _default_redactor
+            ), f"the reader can rejoin a key across {above!r} and {below!r}"
+        # And a seam withheld on a shipped chunk is counted, so the turn's notice
+        # reports it rather than leaving a silent gap.
+        assert any(CREDENTIAL_SEAM_TAG in t for t in screen), "precondition: the seam opened"
+        assert r._redacted_creds > 0, r._redacted_creds
+
     def test_streaming_strips_options_and_renders_keyboard(self) -> None:
         cli = self._drive(
             [
@@ -2398,6 +2738,861 @@ class TestRenderer:
 
 
 # ── renderer.py: table-aware splitting + rich budget selection ──────────────
+
+
+class TestReasoningIsGradedAndRecordedLikeAnyOtherMessage:
+    """The 💭 quote is a message of its own, so the seam rules apply to it in full.
+
+    It is sent, so it is graded against the answer it lands under. And once a reader
+    has it, it is the nearest text above whatever this renderer sends next, so that
+    message is graded against the reasoning rather than against the answer. The
+    source form is what is recorded: the quote wrapper's own closing tag would
+    answer the next pair's question instead of the reasoning's.
+    """
+
+    _HEAD_HALF = "AKIAIOSF"
+    _TAIL_HALF = "ODNN7EXAMPLE"
+
+    def test_the_note_is_graded_against_the_answer_it_lands_under(self) -> None:
+        cli = FakeClient()
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0", show_thinking=True
+        )
+
+        async def _go() -> None:
+            r._buf = [f"the answer trails off at {self._HEAD_HALF}"]
+            await r._seal_current()
+            r._open_new_message()
+            assert r._frozen_above.endswith(self._HEAD_HALF), r._frozen_above
+            await r.on_thinking(f"{self._TAIL_HALF} opens the reasoning")
+            await r._post_thinking()
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) >= 2, screen
+        assert CREDENTIAL_SEAM_TAG in screen[-1], screen[-1]
+
+    def test_a_delivered_note_is_what_the_next_message_is_graded_against(self) -> None:
+        cli = FakeClient()
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0", show_thinking=True
+        )
+
+        async def _go() -> None:
+            await r.on_thinking(f"the reasoning trails off at {self._HEAD_HALF}")
+            await r._post_thinking()
+            # The next message lands under the reasoning, not under the answer.
+            r._buf = [f"{self._TAIL_HALF} and the rest"]
+            await r._seal_current()
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) >= 2, screen
+        assert CREDENTIAL_SEAM_TAG in screen[-1], screen[-1]
+
+    def test_a_note_nobody_received_is_not_what_the_next_message_is_graded_against(
+        self,
+    ) -> None:
+        """An id-less send created no message, so the screen is unchanged by it.
+
+        Grading the next message against that text would withhold characters from
+        the one message the reader does have, on account of a message they do not.
+        """
+
+        class _ThinkingSendLandsNothing(FakeClient):  # type: ignore[misc]
+            async def send_message(self, chat_id: int, text: str, **kw: Any) -> Any:
+                if "💭" in text:
+                    self.sent.append((text, None))
+                    return None
+                return await super().send_message(chat_id, text, **kw)
+
+        cli = _ThinkingSendLandsNothing()
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0", show_thinking=True
+        )
+
+        async def _go() -> None:
+            await r.on_thinking(f"the reasoning trails off at {self._HEAD_HALF}")
+            await r._post_thinking()
+            r._buf = [f"{self._TAIL_HALF} and the rest"]
+            await r._seal_current()
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert any("💭" in t for t in screen), "precondition: the note was attempted"
+        assert self._TAIL_HALF in screen[-1], screen[-1]
+        assert CREDENTIAL_SEAM_TAG not in screen[-1], screen[-1]
+
+
+class TestALandedAlbumIsTheMessageTheNextSendLandsUnder:
+    """A picture message carries no text, and that is an answer, not an absence.
+
+    The album is sent AFTER the answer's bubble, so it is the lowest message on
+    screen and the reasoning posted next sits under IT. Grading that reasoning
+    against the answer two bubbles up withholds a leading run of it over a pair no
+    reader has -- the album is between them, and the Bot API sends it with no
+    caption, so there is nothing there for a credential to continue through.
+    """
+
+    _HEAD_HALF = "AKIAIOSF"
+    _TAIL_HALF = "ODNN7EXAMPLE"
+
+    def _picture(self) -> OutboundFile:
+        return OutboundFile(
+            path="/pics/one.png", data=b"\x89PNG\r\n\x1a\n", alt="a picture", mime="image/png"
+        )
+
+    def _reasoning_after_an_answer(self, cli: Any, *, album: bool) -> Any:
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0", show_thinking=True
+        )
+
+        async def _go() -> None:
+            r._buf = [f"the answer trails off at {self._HEAD_HALF}"]
+            await r._seal_current()
+            assert self._HEAD_HALF in r._landed_text, r._landed_text
+            if album:
+                await r._send_uploads([self._picture()])
+                assert cli.media_sent, "precondition: the album was sent"
+            await r.on_thinking(f"{self._TAIL_HALF} opens the reasoning")
+            await r._post_thinking()
+
+        asyncio.run(_go())
+        return r
+
+    def test_the_reasoning_under_an_album_keeps_the_characters_it_would_lose(self) -> None:
+        cli = FakeClient()
+        self._reasoning_after_an_answer(cli, album=True)
+
+        note = [t for t, _ in cli.sent][-1]
+        assert "💭" in note, note
+        assert self._TAIL_HALF in note, note
+        assert CREDENTIAL_SEAM_TAG not in note, note
+
+    def test_without_the_album_the_very_same_reasoning_is_withheld(self) -> None:
+        """The control: grading is on, and the album is what changes the answer.
+
+        Without this, a check that simply stopped grading the reasoning would pass
+        the test above.
+        """
+        cli = FakeClient()
+        self._reasoning_after_an_answer(cli, album=False)
+
+        note = [t for t, _ in cli.sent][-1]
+        assert "💭" in note, note
+        assert CREDENTIAL_SEAM_TAG in note, note
+
+    def test_the_album_stops_the_ranking_instead_of_falling_further_up(self) -> None:
+        """A message with no text is still a message, so the ranking stops at it.
+
+        Recording an empty string would leave the ranking falling through to a bubble
+        further up the screen, which is not what the reasoning lands under either --
+        and that bubble's tail then withholds characters over a pair two messages
+        apart.
+        """
+        cli = FakeClient()
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0", show_thinking=True
+        )
+
+        async def _go() -> None:
+            r._buf = [f"an earlier bubble trails off at {self._HEAD_HALF}"]
+            await r._seal_current()
+            r._open_new_message()
+            assert r._frozen_above.endswith(self._HEAD_HALF), r._frozen_above
+            r._buf = ["a second answer with an ordinary ending."]
+            await r._seal_current()
+            await r._send_uploads([self._picture()])
+            assert cli.media_sent, "precondition: the album was sent"
+            await r.on_thinking(f"{self._TAIL_HALF} opens the reasoning")
+            await r._post_thinking()
+
+        asyncio.run(_go())
+
+        note = [t for t, _ in cli.sent][-1]
+        assert "💭" in note, note
+        assert self._TAIL_HALF in note, note
+        assert CREDENTIAL_SEAM_TAG not in note, note
+
+    def test_an_album_that_did_not_land_leaves_the_answer_as_the_message_above(self) -> None:
+        """Recorded on confirmed delivery only, like every other sink here.
+
+        An upload that failed created no message, so the answer is still what a
+        reader has above whatever comes next.
+        """
+        cli = FakeClient()
+        cli.media_fails = True
+        r = self._reasoning_after_an_answer(cli, album=True)
+
+        assert r._landed_text != _TEXTLESS_SEND, r._landed_text
+        assert any("Couldn't upload" in t for t, _ in cli.sent), cli.sent
+
+
+class TestAFreshSendFreezesWhatItWasGradedAgainst:
+    """The withholding a send applies has to survive the next edit of that bubble.
+
+    A fresh send lands under the lowest message on screen and is graded against it.
+    That message is then the one directly above this bubble, and every later edit of
+    the bubble is graded against the frozen text -- so a send that clears the lower
+    message without freezing it leaves that text named nowhere. The send withholds,
+    the first ordinary edit grades against an empty predecessor, and the screen ends
+    up holding the key the send had just held back.
+    """
+
+    _HEAD_HALF = "AKIAIOSF"
+    _TAIL_HALF = "ODNN7EXAMPLE"
+
+    def test_an_edit_after_the_first_render_is_still_graded_against_the_prompt(self) -> None:
+        cli = FakeClient()
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0"
+        )
+
+        async def _go() -> None:
+            await r.on_turn_start()
+            await r.on_prompt_choice(
+                [], request_id="rq1", tool_title="bash", tool_input=f"run {self._HEAD_HALF}"
+            )
+            # The live frame's FIRST render is a send, graded against the prompt.
+            await r.on_text_chunk(f"{self._TAIL_HALF} opens the answer")
+            await r._stream_live(force=True)
+            # An ordinary second render: same bubble, an EDIT rather than a send.
+            await r.on_text_chunk(" and continues")
+            await r._stream_live(force=True)
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        prompt = next(t for t in screen if self._HEAD_HALF in t)
+        assert CREDENTIAL_SEAM_TAG in screen[-1], f"precondition: the send withheld, {screen[-1]!r}"
+        assert cli.edits, "precondition: the second render edited the bubble"
+        edited = cli.edits[-1][1]
+        assert "and continues" in edited, edited
+        assert CREDENTIAL_SEAM_TAG in edited, edited
+        assert not joins_to_a_credential(
+            prompt, edited, _default_redactor
+        ), f"the reader can rejoin a key across {prompt!r} and {edited!r}"
+
+
+class TestAFailedUploadsNoticeIsAMessageLikeAnyOther:
+    """The notice bubbles carry model-authored markup and they are the lowest ones.
+
+    The success half of this branch records the album; the failure half posts
+    bubbles instead, so the reasoning that follows lands under the LAST of them.
+    Graded against the sealed answer two messages up, it loses a leading run of
+    itself over a pair no reader has.
+    """
+
+    _HEAD_HALF = "AKIAIOSF"
+    _TAIL_HALF = "ODNN7EXAMPLE"
+
+    def test_the_reasoning_after_the_notice_is_graded_against_the_notice(self) -> None:
+        cli = FakeClient()
+        cli.media_fails = True
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0", show_thinking=True
+        )
+        picture = OutboundFile(
+            path="/pics/one.png", data=b"\x89PNG\r\n\x1a\n", alt="a picture", mime="image/png"
+        )
+
+        async def _go() -> None:
+            r._buf = [f"the answer trails off at {self._HEAD_HALF}"]
+            await r._seal_current()
+            assert self._HEAD_HALF in r._landed_text, r._landed_text
+            await r._send_uploads([picture])
+            await r.on_thinking(f"{self._TAIL_HALF} opens the reasoning")
+            await r._post_thinking()
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert any("Couldn't upload" in t for t in screen), screen
+        notice = [t for t in screen if "Couldn't upload" in t or t.startswith("![")][-1]
+        note = screen[-1]
+        assert "💭" in note, note
+        assert self._TAIL_HALF in note, note
+        assert CREDENTIAL_SEAM_TAG not in note, note
+        assert not joins_to_a_credential(
+            notice, note, _default_redactor
+        ), f"the reader can rejoin a key across {notice!r} and {note!r}"
+
+
+class TestADeletedBubbleIsNotTheMessageAboveAnything:
+    """State that names a removed message grades the next send against a phantom.
+
+    An image-only reply retires the live bubble -- a transient tool footer or stall
+    mark that belonged to a turn in progress. The bubble is GONE, so the message
+    above whatever comes next is the one that was above IT. Keeping the retired
+    text named outranks the frozen text, so the real pair is never asked: with the
+    upload and every recovery send failing, the reasoning post is graded against a
+    bubble nobody can see while the message it truly sits under ends mid-credential.
+    """
+
+    _HEAD_HALF = "AKIAIOSF"
+    _TAIL_HALF = "ODNN7EXAMPLE"
+
+    def _picture(self) -> OutboundFile:
+        return OutboundFile(
+            path="/pics/one.png", data=b"\x89PNG\r\n\x1a\n", alt="a picture", mime="image/png"
+        )
+
+    def _reasoning_after_a_retired_frame(self, cli: Any) -> Any:
+        """An earlier bubble ends mid-credential; a footer frame is retired over it."""
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0", show_thinking=True
+        )
+
+        async def _go() -> None:
+            r._buf = [f"an earlier bubble trails off at {self._HEAD_HALF}"]
+            await r._seal_current()
+            r._open_new_message()
+            assert r._frozen_above.endswith(self._HEAD_HALF), r._frozen_above
+            # A tool footer lands its own frame -- innocuous text of its own.
+            r._buf = []  # a footer frame is one with no answer text pending
+            await r.on_tool_call("tc1", "bash")
+            assert r._stream_mid is not None, "precondition: a live frame exists"
+            assert self._HEAD_HALF not in r._landed_text, r._landed_text
+            # An image-only reply: the footer frame is retired, then the upload and
+            # every recovery send fail, so nothing records a new predecessor.
+            await r._retire_live_frame()
+            await r._send_uploads([self._picture()])
+            await r.on_thinking(f"{self._TAIL_HALF} opens the reasoning")
+            await r._post_thinking()
+
+        asyncio.run(_go())
+        return r
+
+    def test_a_confirmed_removal_hands_grading_back_to_the_message_above_it(self) -> None:
+        class _NoticeSendsLandNothing(FakeClient):  # type: ignore[misc]
+            """The upload fails AND its recovery notice lands nothing.
+
+            Correlated rather than contradicting: a rate-limited chat or a lost
+            network fails both, which is why nothing records a new predecessor.
+            """
+
+            async def send_message(self, chat_id: int, text: str, **kw: Any) -> Any:
+                if "Couldn't upload" in text or text.startswith("!["):
+                    self.sent.append((text, None))
+                    return None
+                return await super().send_message(chat_id, text, **kw)
+
+        cli = _NoticeSendsLandNothing()
+        cli.media_fails = True
+        self._reasoning_after_a_retired_frame(cli)
+
+        assert cli.deleted, "precondition: the footer frame was removed"
+        assert any("Couldn't upload" in t for t, _ in cli.sent), "precondition: recovery ran"
+        note = [t for t, _ in cli.sent if "💭" in t][-1]
+        assert CREDENTIAL_SEAM_TAG in note, note
+
+    def test_a_refused_removal_keeps_the_frame_as_the_message_above(self) -> None:
+        """The other direction: the bubble is still there, so its text still answers.
+
+        Clearing unconditionally would grade the next send against the message one
+        higher and leave the pair the reader really has unasked.
+        """
+        cli = FakeClient()
+        cli.delete_ok = False
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0", show_thinking=True
+        )
+
+        async def _go() -> None:
+            r._buf = ["an earlier bubble with an ordinary ending."]
+            await r._seal_current()
+            r._open_new_message()
+            r._buf = [f"a frame that trails off at {self._HEAD_HALF}"]
+            await r._stream_live(force=True)
+            assert self._HEAD_HALF in r._landed_text, r._landed_text
+            r._buf = []
+            await r._retire_live_frame()
+            await r.on_thinking(f"{self._TAIL_HALF} opens the reasoning")
+            await r._post_thinking()
+
+        asyncio.run(_go())
+
+        assert cli.deleted, "precondition: the removal was attempted"
+        note = [t for t, _ in cli.sent if "💭" in t][-1]
+        assert CREDENTIAL_SEAM_TAG in note, note
+
+    def test_the_rich_replacement_freezes_the_message_above_the_bubble_it_dropped(self) -> None:
+        """A state pin: nothing may keep naming the bubble the rich send replaced.
+
+        No delivery path reads this before it is overwritten -- the next render is a
+        fresh send, which re-freezes -- so the assertion is on the state itself.
+        Naming a removed bubble is one rename away from being read, which is how the
+        retired-frame case above became reachable.
+        """
+        cli = FakeClient()
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0"
+        )
+
+        async def _go() -> None:
+            r._buf = [f"an earlier bubble trails off at {self._HEAD_HALF}"]
+            await r._seal_current()
+            r._open_new_message()
+            r._buf = ["a streamed plaintext frame"]
+            await r._stream_live(force=True)
+            assert r._stream_mid is not None, "precondition: a plaintext bubble streamed"
+            r._buf = ["| a | b |\n| - | - |\n| 1 | 2 |"]
+            await r._seal_current()
+
+        asyncio.run(_go())
+
+        assert cli.rich_sent, "precondition: the rich message replaced the bubble"
+        assert cli.deleted, "precondition: the plaintext bubble was dropped"
+        assert "a streamed plaintext frame" not in r._frozen_above, r._frozen_above
+        assert self._HEAD_HALF in r._frozen_above, r._frozen_above
+
+
+class TestACompactionNoticeIsTheLowestMessageToo:
+    """The notice is a standalone bubble, so the next send lands under IT.
+
+    Its own head is the fixed ``🗜️ `` prefix, whose space continues no credential
+    from the message above, so nothing needs withholding at the notice itself. What
+    matters is the message AFTER it, which was graded against a bubble one higher.
+    """
+
+    _HEAD_HALF = "AKIAIOSF"
+    _TAIL_HALF = "ODNN7EXAMPLE"
+
+    def _send_after(self, *, notice: bool, fail_sends: bool = False) -> Any:
+        cli = FakeClient()
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0"
+        )
+
+        async def _go() -> None:
+            r._buf = [f"the answer trails off at {self._HEAD_HALF}"]
+            await r._seal_current()
+            r._open_new_message()
+            assert r._frozen_above.endswith(self._HEAD_HALF), r._frozen_above
+            if notice:
+                if fail_sends:
+
+                    async def _lands_nothing(*_a: Any, **_kw: Any) -> None:
+                        return None
+
+                    cli.send_message = _lands_nothing  # type: ignore[method-assign]
+                await r.on_compaction(72.0)
+                cli.send_message = FakeClient.send_message.__get__(cli)  # type: ignore[method-assign]
+            r._buf = [f"{self._TAIL_HALF} and the rest"]
+            await r._seal_current()
+
+        asyncio.run(_go())
+        return cli, r
+
+    def test_the_send_after_a_notice_is_graded_against_the_notice(self) -> None:
+        cli, _ = self._send_after(notice=True)
+        screen = [t for t, _ in cli.sent]
+        assert any("Compacting" in t for t in screen), screen
+        assert self._TAIL_HALF in screen[-1], screen[-1]
+        assert CREDENTIAL_SEAM_TAG not in screen[-1], screen[-1]
+
+    def test_without_the_notice_the_same_send_is_withheld(self) -> None:
+        cli, _ = self._send_after(notice=False)
+        assert CREDENTIAL_SEAM_TAG in [t for t, _ in cli.sent][-1], cli.sent[-1]
+
+    def test_a_notice_that_landed_nothing_is_not_the_predecessor(self) -> None:
+        """An id-less send created no bubble, so the screen is unchanged by it."""
+        cli, _ = self._send_after(notice=True, fail_sends=True)
+        assert CREDENTIAL_SEAM_TAG in [t for t, _ in cli.sent][-1], cli.sent[-1]
+
+
+class TestSmallTextIsNotAMarkerOnThisChannel:
+    """``-#`` is Discord's small text, and this channel ships those two characters.
+
+    So they stand between the halves on screen, and withholding over them would drop
+    characters for a pair no reader ever sees joined. The families this channel DOES
+    consume -- a heading becomes bold, a blockquote becomes a quote -- still count.
+    """
+
+    _HEAD_HALF = "AKIAIOSF"
+    _TAIL_HALF = "ODNN7EXAMPLE"
+
+    def _sealed_under_a_credential_tail(self, opener: str) -> str:
+        cli = FakeClient()
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0"
+        )
+
+        async def _go() -> None:
+            r._buf = [f"the answer trails off at {self._HEAD_HALF}"]
+            await r._seal_current()
+            r._open_new_message()
+            assert r._frozen_above.endswith(self._HEAD_HALF), r._frozen_above
+            r._buf = [f"{opener}{self._TAIL_HALF} and the rest"]
+            await r._seal_current()
+
+        asyncio.run(_go())
+        return [t for t, _ in cli.sent][-1]
+
+    def test_a_message_opening_with_small_text_keeps_its_characters(self) -> None:
+        sent = self._sealed_under_a_credential_tail("-# ")
+        assert self._TAIL_HALF in sent, sent
+        assert CREDENTIAL_SEAM_TAG not in sent, sent
+
+    @pytest.mark.parametrize(
+        "opener",
+        [pytest.param("# ", id="heading"), pytest.param("> ", id="blockquote")],
+    )
+    def test_a_marker_this_channel_does_consume_is_still_withheld(self, opener: str) -> None:
+        sent = self._sealed_under_a_credential_tail(opener)
+        assert CREDENTIAL_SEAM_TAG in sent, sent
+
+
+class TestATruncatedReasoningPostRecordsOnlyWhatTheReaderGot:
+    """The record has to name the message, not the body it was cut from.
+
+    Reasoning is unbounded, so an oversized post is truncated to one bubble. The
+    record is what the NEXT message is graded against, so recording the full body
+    names a tail that is off the screen: the next send is then checked against
+    characters nobody has while the pair it really forms goes unasked. Cutting the
+    source rather than its escaped form also keeps an escape entity whole.
+    """
+
+    def test_the_record_is_the_prefix_the_bubble_carries(self) -> None:
+        cli = FakeClient()
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0", show_thinking=True
+        )
+        # Every character escapes to six, so the escaped form outruns the budget
+        # long before the source does -- and a naive slice of it lands mid-entity.
+        body = '"' * 4000
+
+        async def _go() -> None:
+            await r.on_thinking(body)
+            await r._post_thinking()
+
+        asyncio.run(_go())
+
+        sent = [t for t, _ in cli.sent][-1]
+        assert "💭" in sent, sent
+        assert "&quot;" in sent, sent
+        quoted = sent[sent.index("💭") + 2 : sent.index("</blockquote>")]
+        assert "&am" not in quoted and "&quo" not in quoted.replace("&quot;", ""), quoted
+        # The record is the SOURCE prefix of exactly that much, nothing longer.
+        assert r._frozen_above, "precondition: the post landed and was recorded"
+        assert html.escape(r._frozen_above) == quoted, (len(r._frozen_above), len(quoted))
+        assert len(r._frozen_above) < len(body), (len(r._frozen_above), len(body))
+
+    def test_an_astral_body_fits_the_units_telegram_counts(self) -> None:
+        """A code-point check passes a payload the API then refuses whole.
+
+        An astral character is one code point and TWO UTF-16 units, so a body of
+        emoji sized by code points goes out over the limit and Telegram rejects the
+        message -- losing the reasoning rather than truncating it.
+        """
+        cli = FakeClient()
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0", show_thinking=True
+        )
+
+        async def _go() -> None:
+            await r.on_thinking("\U0001f600" * 3000)
+            await r._post_thinking()
+
+        asyncio.run(_go())
+
+        sent = [t for t, _ in cli.sent][-1]
+        inner = sent[sent.index("💭") + 2 : sent.index("</blockquote>")]
+        assert inner, sent
+        assert _utf16_len(inner) <= r._thinking_budget(), (_utf16_len(inner), len(inner))
+
+    def test_a_post_that_fits_records_all_of_itself(self) -> None:
+        """The other direction: nothing is dropped when nothing had to be."""
+        cli = FakeClient()
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0", show_thinking=True
+        )
+
+        async def _go() -> None:
+            await r.on_thinking("a short reasoning body")
+            await r._post_thinking()
+
+        asyncio.run(_go())
+
+        assert r._frozen_above == "a short reasoning body", r._frozen_above
+
+
+class TestAnApprovalPromptIsWhatTheNextSendLandsUnder:
+    """The prompt is a bubble of its own, carrying the tool's own arguments.
+
+    Those arguments are model output and they end wherever the input ends, which
+    can be mid-credential. The prompt sits BELOW the answer bubble -- that is the
+    point of it, so streaming edits cannot clobber the buttons -- so the next
+    message this renderer sends lands under the prompt, not under the answer, and
+    it is the prompt its seam has to be graded against.
+    """
+
+    _HEAD_HALF = "AKIAIOSF"
+    _TAIL_HALF = "ODNN7EXAMPLE"
+
+    def test_the_send_after_a_prompt_is_graded_against_the_prompt(self) -> None:
+        cli = FakeClient()
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0"
+        )
+
+        async def _go() -> None:
+            await r.on_turn_start()
+            await r.on_prompt_choice(
+                [], request_id="rq1", tool_title="bash", tool_input=f"run {self._HEAD_HALF}"
+            )
+            r._buf = [f"{self._TAIL_HALF} and the rest"]
+            await r._seal_current()
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) >= 2, screen
+        assert self._HEAD_HALF in screen[-2], f"precondition: the prompt carries it, {screen[-2]!r}"
+        assert CREDENTIAL_SEAM_TAG in screen[-1], screen[-1]
+
+    def test_the_prompt_outranks_the_answer_bubble_above_it(self) -> None:
+        """The answer bubble is not the reader's lowest message once a prompt lands.
+
+        Graded against the answer, this send passes: the answer is innocuous. The
+        pair the reader actually has is the prompt above it.
+        """
+        cli = FakeClient()
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0"
+        )
+
+        async def _go() -> None:
+            await r.on_turn_start()
+            r._buf = ["an answer the reader already has"]
+            await r._stream_live(force=True)
+            assert r._landed_text, "precondition: the answer bubble landed"
+            await r.on_prompt_choice(
+                [], request_id="rq1", tool_title="bash", tool_input=f"run {self._HEAD_HALF}"
+            )
+            r._open_new_message()
+            r._buf = [f"{self._TAIL_HALF} and the rest"]
+            await r._seal_current()
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert CREDENTIAL_SEAM_TAG in screen[-1], screen[-1]
+
+    def test_a_frame_opened_under_a_prompt_is_edited_against_the_prompt(self) -> None:
+        """The prompt is still the message above the NEXT bubble, not just the next send.
+
+        A bubble opened under it is later edited in place -- a presentation snapshot
+        replaces its head -- and an edit is graded against the message above the
+        bubble it replaces. Unless the prompt became that message when the new one
+        opened, the pair a reader has is never the pair asked about.
+        """
+        cli = FakeClient()
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0"
+        )
+
+        async def _go() -> None:
+            await r.on_turn_start()
+            await r.on_prompt_choice(
+                [], request_id="rq1", tool_title="bash", tool_input=f"run {self._HEAD_HALF}"
+            )
+            r._open_new_message()
+            assert r._frozen_above.endswith(self._HEAD_HALF), r._frozen_above
+            r._buf = ["an opening frame with nothing in it"]
+            await r._stream_live(force=True)
+            assert r._stream_mid is not None, "precondition: a live bubble exists"
+            # The head is replaced, so the pair above it is a live question again.
+            r._buf = [f"{self._TAIL_HALF} and the rest"]
+            await r._stream_live(force=True)
+
+        asyncio.run(_go())
+
+        assert cli.edits, "precondition: the frame was edited in place"
+        assert CREDENTIAL_SEAM_TAG in cli.edits[-1][1], cli.edits[-1]
+
+    def test_a_live_edit_above_the_prompt_does_not_shadow_it(self) -> None:
+        """An edit replaces a bubble ABOVE the prompt, so it cannot become the lowest.
+
+        The prompt clears the live bubble's landed text, but an ordinary successful
+        edit puts it straight back. Ranked below that text, the prompt is then
+        skipped by every fresh send although it is still the reader's last bubble.
+        """
+        cli = FakeClient()
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0", show_thinking=True
+        )
+
+        async def _go() -> None:
+            await r.on_turn_start()
+            r._buf = ["an opening frame"]
+            await r._stream_live(force=True)
+            await r.on_prompt_choice(
+                [], request_id="rq1", tool_title="bash", tool_input=f"run {self._HEAD_HALF}"
+            )
+            # An ordinary successful edit of the bubble ABOVE the prompt.
+            r._buf = ["an opening frame, now with more of the answer"]
+            r._last_edit = 0.0
+            await r._stream_live(force=True)
+            assert r._landed_text, "precondition: the edit repopulated the landed text"
+            assert r._prior_above_a_fresh_send().endswith(
+                self._HEAD_HALF
+            ), r._prior_above_a_fresh_send()
+            # Any fresh send now lands under the prompt, not under that bubble.
+            await r.on_thinking(f"{self._TAIL_HALF} opens the reasoning")
+            await r._post_thinking()
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert CREDENTIAL_SEAM_TAG in screen[-1], screen[-1]
+
+    def test_a_confirmed_send_below_the_prompt_supersedes_it(self) -> None:
+        """The allow direction: once something lands under the prompt, it is lowest.
+
+        Otherwise the prompt would be graded against forever and later messages
+        would lose characters on account of a bubble two places up.
+        """
+        cli = FakeClient()
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0", show_thinking=True
+        )
+
+        async def _go() -> None:
+            await r.on_turn_start()
+            await r.on_prompt_choice(
+                [], request_id="rq1", tool_title="bash", tool_input=f"run {self._HEAD_HALF}"
+            )
+            assert r._below_live, "precondition: the prompt was recorded"
+            await r.on_thinking("reasoning that ends harmlessly")
+            await r._post_thinking()
+            assert not r._below_live, r._below_live
+            r._buf = [f"{self._TAIL_HALF} and the rest"]
+            await r._seal_current()
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert CREDENTIAL_SEAM_TAG not in screen[-1], screen[-1]
+
+    def test_the_promotion_takes_the_lowest_message_not_the_live_one(self) -> None:
+        """When a new message opens, what it opens UNDER is the lowest bubble.
+
+        With both a landed live bubble and a prompt below it, promoting the live one
+        freezes the wrong text: a later in-place edit of the new bubble is then
+        graded against a message two places up.
+        """
+        cli = FakeClient()
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0"
+        )
+
+        async def _go() -> None:
+            await r.on_turn_start()
+            r._buf = ["an opening frame"]
+            await r._stream_live(force=True)
+            await r.on_prompt_choice(
+                [], request_id="rq1", tool_title="bash", tool_input=f"run {self._HEAD_HALF}"
+            )
+            r._buf = ["an opening frame, with more of the answer"]
+            r._last_edit = 0.0
+            await r._stream_live(force=True)
+            assert r._landed_text and r._below_live, "precondition: both are set"
+            r._open_new_message()
+            assert r._frozen_above.endswith(self._HEAD_HALF), r._frozen_above
+            # And behaviourally: the new bubble's own in-place edit is graded against it.
+            r._buf = ["a harmless opening"]
+            await r._stream_live(force=True)
+            r._buf = [f"{self._TAIL_HALF} and the rest"]
+            r._last_edit = 0.0
+            await r._stream_live(force=True)
+
+        asyncio.run(_go())
+
+        assert cli.edits, "precondition: the new bubble was edited in place"
+        assert CREDENTIAL_SEAM_TAG in cli.edits[-1][1], cli.edits[-1]
+
+    def test_the_tail_is_graded_against_the_frame_when_every_leading_chunk_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing promoted, so the frozen text is not what the tail lands under.
+
+        Only a landed chunk advances the frozen text. When every delivery attempt for
+        every leading chunk fails, the live frame is still the reader's lowest
+        message -- and the live id was already cleared, so the tail is SENT beneath
+        that frame with no later re-grade.
+        """
+
+        class _NothingLands(FakeClient):  # type: ignore[misc]
+            async def send_message(self, chat_id: int, text: str, **kw: Any) -> Any:
+                self.sent.append((text, kw.get("reply_markup")))
+                self.send_chats.append(chat_id)
+                return None
+
+            async def edit_message(self, chat_id: int, mid: int, text: str, **kw: Any) -> Any:
+                self.edits.append((mid, text, kw.get("reply_markup")))
+                return False
+
+        cli = _NothingLands()
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0"
+        )
+        # A live frame is on screen and ends mid-credential; the message above it is
+        # harmless, so grading against the frozen text would let the tail through.
+        r._stream_mid = 4242
+        r._landed_text = f"the frame trails off at {self._HEAD_HALF}"
+        r._frozen_above = "an older message, harmless"
+        monkeypatch.setattr(r, "_rendered_limit", lambda: 8)
+        monkeypatch.setattr(
+            r,
+            "_degraded_table_chunks",
+            lambda _t: ["a leading chunk nobody receives", f"{self._TAIL_HALF} and the rest"],
+        )
+
+        _html, tail = asyncio.run(r._seal_without_rich("a segment long enough to degrade"))
+
+        assert not r._frozen_above.endswith(
+            self._HEAD_HALF
+        ), "precondition: nothing promoted the frame"
+        assert CREDENTIAL_SEAM_TAG in tail, tail
+
+    def test_a_prompt_nobody_received_is_not_what_the_next_send_is_graded_against(
+        self,
+    ) -> None:
+        """An id-less send created no bubble, so the screen is unchanged by it.
+
+        Withholding characters from the one message the reader does have, on account
+        of a message they do not, is the mirror of the hazard.
+        """
+
+        class _PromptSendLandsNothing(FakeClient):  # type: ignore[misc]
+            async def send_message(self, chat_id: int, text: str, **kw: Any) -> Any:
+                if "🔐" in text:
+                    self.sent.append((text, kw.get("reply_markup")))
+                    self.send_chats.append(chat_id)
+                    return None
+                return await super().send_message(chat_id, text, **kw)
+
+        cli = _PromptSendLandsNothing()
+        r = TelegramRenderer(  # type: ignore[arg-type]
+            cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0"
+        )
+
+        async def _go() -> None:
+            await r.on_turn_start()
+            await r.on_prompt_choice(
+                [], request_id="rq1", tool_title="bash", tool_input=f"run {self._HEAD_HALF}"
+            )
+            r._buf = [f"{self._TAIL_HALF} and the rest"]
+            await r._seal_current()
+
+        asyncio.run(_go())
+
+        assert not r._below_live, r._below_live
+        assert CREDENTIAL_SEAM_TAG not in [t for t, _ in cli.sent][-1], cli.sent[-1]
 
 
 class TestTableAwareSplitting:

@@ -54,6 +54,51 @@ _EMPHASIS_RUN = re.compile(r"(?:[*_~`]|\|\|)+")
 # safe, since the fallback is to scan the text as written.
 _MD_LINK = re.compile(r"\[([^\[\]\n]*)\]\(([^()\n]*)\)")
 _SLACK_LINK = re.compile(r"<([^<>|\n]*)\|([^<>\n]*)>")
+# Markers a platform consumes at the START of a line, leaving NO character in
+# their place: Markdown headings, Discord's ``-# `` small text, and blockquotes.
+# Same splitter property as ``**`` -- the marker vanishes at render time, so the
+# text after it joins whatever the reader has directly above.
+#
+# List bullets (``- ``, ``* ``, ``1. ``) are deliberately absent: the platform
+# SUBSTITUTES a visible bullet or number rather than removing the marker, so a
+# character still stands between the two halves on screen. Six heading levels
+# even where a channel implements three, because the canonical form must not
+# depend on which subset a client supports and a wider removal only ever
+# withholds more.
+#
+# One pass is enough although this runs last. The match is anchored at a line
+# start, so removing it cannot bring two characters together that were not
+# already adjacent -- there is nothing before it on the line to join to -- and
+# no new inline delimiter run can form out of the removal. Repeating the group
+# handles a blockquote that itself carries a heading (``> # title``).
+#
+# The blockquote is the one family whose trailing space is OPTIONAL, because a
+# channel consumes ``>`` with or without it: this repo's own Telegram converter
+# matches ``^&gt;[ \t]?`` and puts nothing in its place, so ``>KEY`` reaches the
+# reader as ``KEY``. A heading and Discord's small text keep the space required,
+# which is what their own parsers demand -- ``#KEY`` is literal text on screen,
+# and treating it as a marker would withhold characters over a pair that shows a
+# ``#`` between the halves.
+#
+# The indent stops at three, where every parser here stops: this repo's own
+# heading rule is ``^\s{0,3}#{1,6}\s+``, and a fourth space makes the line
+# INDENTED CODE, which a channel shows verbatim marker and all. Admitting any
+# indent is the one way this family can be too wide rather than too narrow, and
+# too wide costs real characters -- a four-space ``# text`` under a frozen
+# credential prefix would be withheld and replaced by the tag, losing output
+# that was never at risk.
+_BLOCK_MARKER = re.compile(r"(?m)^[ \t]{0,3}(?:(?:#{1,6}|-#)[ \t]+|>{1,3}[ \t]*)+")
+
+#: The same family for a channel that shows ``-#`` LITERALLY. Small text is
+#: Discord's own markup, and a channel that does not implement it puts those two
+#: characters on screen between the halves -- so removing them from the canonical
+#: form withholds characters over a pair the reader never sees joined. Measured on
+#: this repo's own Telegram converter: ``-# text`` reaches the reader verbatim,
+#: while ``# text`` becomes ``<b>text</b>`` and ``> text`` a ``<blockquote>``, both
+#: with the marker consumed. A caller that knows its channel passes this; the wide
+#: default stays for :func:`redact_for_display`, whose floor serves every channel
+#: at once and can only err toward withholding.
+BLOCK_MARKERS_WITHOUT_SMALL_TEXT = re.compile(r"(?m)^[ \t]{0,3}(?:#{1,6}[ \t]+|>{1,3}[ \t]*)+")
 
 
 def strip_ansi(text: str) -> str:
@@ -87,10 +132,10 @@ def _strip_format_chars(text: str) -> str:
     return drop_format_chars(text)
 
 
-def canonicalize_display(text: str) -> str:
+def canonicalize_display(text: str, *, block_markers: "re.Pattern[str]" = _BLOCK_MARKER) -> str:
     """Reduce *text* to what the platform will actually SHOW a reader.
 
-    Three families, one property: the platform removes them at render time, so a
+    Four families, one property: the platform removes them at render time, so a
     credential broken across them is whole on screen while every literal scan
     sees it broken.
 
@@ -99,20 +144,33 @@ def canonicalize_display(text: str) -> str:
     * **emphasis / code / spoiler delimiters** vanish -- ``AKIA**REST**`` and
       Discord's ``AKIA||REST||`` likewise;
     * **invisible format characters** were never rendered at all -- see
-      :func:`_strip_format_chars`.
+      :func:`_strip_format_chars`;
+    * **line-leading block markers** -- a heading, Discord's small text or a
+      blockquote -- are consumed with nothing left in their place, so a message
+      opening ``# REST`` shows only ``REST`` under whatever precedes it.
 
     Links are reduced FIRST: a url can itself contain ``_`` or ``~``, and dropping
-    those before the url is removed would corrupt the label boundaries. Format
-    characters are dropped LAST, so a delimiter run that a zero-width character
-    had split (``*``+ZWSP+``*``) is still recognised as the run it renders as.
+    those before the url is removed would corrupt the label boundaries. Delimiters
+    go next and invisible characters after them, which is safe in either order
+    because the delimiter pattern matches a SINGLE delimiter as readily as a run:
+    ``*``+ZWSP+``*`` loses each ``*`` on its own, so nothing depends on the
+    zero-width character being gone first.
+    Block markers are removed LAST, because every earlier family can be what
+    reveals one: ``[#](url) REST`` is a heading only after the link collapses.
     """
     out = _MD_LINK.sub(r"\1", text)
     out = _SLACK_LINK.sub(r"\2", out)
     out = _EMPHASIS_RUN.sub("", out)
-    return _strip_format_chars(out)
+    return block_markers.sub("", _strip_format_chars(out))
 
 
-def joins_to_a_credential(head: str, tail: str, redactor: Callable[[str], str]) -> bool:
+def joins_to_a_credential(
+    head: str,
+    tail: str,
+    redactor: Callable[[str], str],
+    *,
+    block_markers: "re.Pattern[str]" = _BLOCK_MARKER,
+) -> bool:
     """Would a reader shown *head* and then *tail* see a key neither half holds?
 
     A cap that cuts text into two messages is applied to the RAW string, while the
@@ -163,8 +221,9 @@ def joins_to_a_credential(head: str, tail: str, redactor: Callable[[str], str]) 
     head_safe = redact_for_display(head, redactor)[0]
     tail_safe = redact_for_display(tail, redactor)[0]
     readings = (
-        canonicalize_display(head_safe + tail_safe),
-        canonicalize_display(head_safe) + canonicalize_display(tail_safe),
+        canonicalize_display(head_safe + tail_safe, block_markers=block_markers),
+        canonicalize_display(head_safe, block_markers=block_markers)
+        + canonicalize_display(tail_safe, block_markers=block_markers),
     )
     return any(redactor(reading) != reading for reading in readings)
 
@@ -216,7 +275,11 @@ CREDENTIAL_SEAM_TAG = "[REDACTED: credential]"
 
 
 def break_credential_seam(
-    prior: str, text: str, redactor: Callable[[str], str]
+    prior: str,
+    text: str,
+    redactor: Callable[[str], str],
+    *,
+    block_markers: "re.Pattern[str]" = _BLOCK_MARKER,
 ) -> tuple[str, bool]:
     """Make *text* safe to show directly under *prior*, which is already on screen.
 
@@ -232,25 +295,50 @@ def break_credential_seam(
     and the tag says out loud that something was held back rather than leaving a
     silent gap.
 
-    Candidates step back EXPONENTIALLY (nothing withheld, then 1, 2, 4, 8 ...
-    characters), the same cost bound :func:`safe_split_offset` takes: the smallest
-    withholding is not needed, only one that works, and the tag alone is always
-    available as the last candidate. So this costs O(log len(*text*)) redaction
-    passes when a seam is open, and the ONE :func:`joins_to_a_credential` call
+    Each candidate is graded on the TRUNCATION, without the tag in front of it.
+    That is not a detail: the tag is itself a redaction placeholder, so a scanner
+    rule that skips an already-redacted value reads the tag as the value and stops
+    looking -- a url cut right after ``?token=`` then passes with ZERO characters
+    withheld, and the reader is shown the whole token under a tag claiming it was
+    held back. Grading the truncation asks the only question that matters, what the
+    reader would rejoin from the characters actually left, and the tag is prepended
+    to the answer afterwards.
+
+    Candidates step back EXPONENTIALLY (1, 2, 4, 8 ... characters), the same cost
+    bound :func:`safe_split_offset` takes: the smallest withholding is not needed,
+    only one that works, and the tag alone is always available as the last
+    candidate. Withholding NOTHING is not a candidate here -- the entry check above
+    has already answered it -- so this costs O(log len(*text*)) redaction passes
+    when a seam is open, and the ONE :func:`joins_to_a_credential` call
     that clears it when nothing is wrong -- which is every ordinary message.
 
     Returns:
         ``(safe_text, broken)``. ``broken`` is True when text was withheld, so a
         caller can count it the way it counts any other redaction.
     """
-    if not prior or not text or not joins_to_a_credential(prior, text, redactor):
+    if (
+        not prior
+        or not text
+        or not joins_to_a_credential(prior, text, redactor, block_markers=block_markers)
+    ):
         return text, False
-    drop, step = 0, 0
+    drop = step = 1
     while drop < len(text):
-        candidate = CREDENTIAL_SEAM_TAG + text[drop:]
-        if not joins_to_a_credential(prior, candidate, redactor):
-            return candidate, True
-        step = 1 if step == 0 else step * 2
+        if not joins_to_a_credential(prior, text[drop:], redactor, block_markers=block_markers):
+            # The graded bytes are what ships. The check clears on the redacted form
+            # of this truncation, and a SUFFIX of a fixed point need not be one
+            # itself: a leading word character blocks the scanner's left boundary, so
+            # dropping it can expose a credential that the whole text did not match.
+            # Returning the raw truncation then puts that credential on screen right
+            # behind a tag announcing that something was withheld -- and the turn's
+            # notice counts the tag, so the reader is told the opposite of the truth.
+            #
+            # Redacting can make the result slightly LONGER than the truncation when
+            # the credential is shorter than the tag. A caller's cap then trims the
+            # end, which removes text and cannot join anything; the alternative is
+            # shipping the key.
+            return CREDENTIAL_SEAM_TAG + redact_for_display(text[drop:], redactor)[0], True
+        step *= 2
         drop = step
     # Nothing of *text* survives. The tag alone cannot extend a key: it is a fixed
     # point of the scan, and *prior* was scrubbed on its own before it was sent.

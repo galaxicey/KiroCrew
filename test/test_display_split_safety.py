@@ -13,6 +13,7 @@ import pytest
 
 from conftest import CREDENTIAL_STRADDLE_SHAPES
 from kiro_crew.messaging.display_safety import (
+    BLOCK_MARKERS_WITHOUT_SMALL_TEXT,
     CREDENTIAL_SEAM_TAG,
     break_credential_seam,
     canonicalize_display,
@@ -125,6 +126,114 @@ class TestJoinsToACredential:
         head = "[AKIA](https://ex.test/a,b"
         tail = ")IOSFODNN7EXAMPLE"
         assert joins_to_a_credential(head, tail, _default_redactor)
+
+    @pytest.mark.parametrize(
+        "marker",
+        [
+            pytest.param("# ", id="heading"),
+            pytest.param("### ", id="deep-heading"),
+            pytest.param("-# ", id="discord-small-text"),
+            pytest.param("> ", id="blockquote"),
+            pytest.param(">", id="blockquote-without-a-space"),
+            pytest.param(">>>", id="nested-blockquote-without-a-space"),
+            pytest.param("> # ", id="blockquoted-heading"),
+        ],
+    )
+    def test_a_cut_before_a_line_leading_block_marker_is_reported(self, marker: str) -> None:
+        # Caught only by canonicalising each side and THEN joining: the marker opens
+        # the lower message, where the platform consumes it and leaves nothing in its
+        # place, so the two rendered messages put the halves of the key side by side.
+        # In the concatenation the same marker is mid-line, where it is literal text.
+        head = "AKIAIOSF"
+        tail = f"{marker}ODNN7EXAMPLE"
+        assert _default_redactor(head) == head, "the head half must be clean alone"
+        assert _default_redactor(tail) == tail, "the tail half must be clean alone"
+        assert joins_to_a_credential(head, tail, _default_redactor)
+
+    def test_the_withheld_text_ships_the_bytes_the_check_graded(self) -> None:
+        """A suffix of a fixed point need not be one itself.
+
+        The scanner matches this token only at a left boundary, so one leading word
+        character blocks it and the whole text passes as clean. Drop that character
+        to clear the seam and the token is suddenly matchable -- the check clears
+        BECAUSE it scanned a redacted copy, and returning the raw truncation would
+        put the key on screen right behind a tag announcing it was withheld, with
+        the turn's notice counting that tag.
+        """
+        token = "M" + "A" * 24 + "." + "B" * 6 + "." + "C" * 27
+        text = f"X{token}"
+        assert _default_redactor(text) == text, "precondition: clean as a whole"
+        assert _default_redactor(token) != token, "precondition: matchable once exposed"
+
+        out, broken = break_credential_seam("the key is sk-ant-", text, _default_redactor)
+
+        assert broken, out
+        assert out.startswith(CREDENTIAL_SEAM_TAG), out
+        body = out[len(CREDENTIAL_SEAM_TAG) :]
+        assert _default_redactor(body) == body, f"the tail still holds a credential: {body!r}"
+
+    def test_a_marker_one_channel_shows_literally_is_not_removed_for_that_channel(self) -> None:
+        """``-#`` is Discord's small text, and a channel without it shows both chars.
+
+        The wide default keeps withholding over it, which is right for the shared
+        redaction floor that serves every channel at once. A caller that knows its
+        own channel asks the narrower question, and gets its own answer.
+        """
+        head, tail = "AKIAIOSF", "-# ODNN7EXAMPLE"
+        assert joins_to_a_credential(head, tail, _default_redactor), "the wide form still does"
+        assert not joins_to_a_credential(
+            head, tail, _default_redactor, block_markers=BLOCK_MARKERS_WITHOUT_SMALL_TEXT
+        )
+        # The families the narrower set still consumes are unchanged.
+        for consumed in ("# ODNN7EXAMPLE", "> ODNN7EXAMPLE"):
+            assert joins_to_a_credential(
+                head, consumed, _default_redactor, block_markers=BLOCK_MARKERS_WITHOUT_SMALL_TEXT
+            ), consumed
+
+    def test_a_cut_before_a_list_bullet_is_allowed(self) -> None:
+        # The allow direction, and the boundary of the block-marker family: a bullet
+        # is SUBSTITUTED for the marker rather than removed, so a visible character
+        # still stands between the halves on screen.
+        assert not joins_to_a_credential("AKIAIOSF", "- ODNN7EXAMPLE", _default_redactor)
+
+    @pytest.mark.parametrize(
+        "opener",
+        [
+            pytest.param("#ODNN7EXAMPLE", id="heading-without-a-space"),
+            pytest.param("-#ODNN7EXAMPLE", id="small-text-without-a-space"),
+            pytest.param("    # ODNN7EXAMPLE", id="four-space-indent-is-code"),
+            pytest.param("     > ODNN7EXAMPLE", id="five-space-indent-is-code"),
+        ],
+    )
+    def test_a_marker_whose_own_parser_needs_a_space_is_literal(self, opener: str) -> None:
+        # The other boundary of the same family, and why the blockquote is the only
+        # alternative with optional whitespace: a heading parser requires the space,
+        # so `#KEY` reaches the reader with the `#` still between the halves. Reading
+        # it as a removed marker would withhold characters over a pair nobody has.
+        # The indent cases are the same mistake one step out: a fourth space makes
+        # the line INDENTED CODE, which a channel shows verbatim, marker and all.
+        assert not joins_to_a_credential("AKIAIOSF", opener, _default_redactor)
+
+    @pytest.mark.parametrize(
+        "opener",
+        [
+            pytest.param("   # ODNN7EXAMPLE", id="three-space-indent-is-a-heading"),
+            pytest.param("  > ODNN7EXAMPLE", id="indented-blockquote"),
+        ],
+    )
+    def test_an_indent_a_parser_still_accepts_is_reported(self, opener: str) -> None:
+        # The deny direction of the same bound: three spaces is where this repo's own
+        # heading rule stops (`^\s{0,3}#{1,6}\s+`), so up to there the marker really
+        # is consumed and the halves really do meet.
+        assert joins_to_a_credential("AKIAIOSF", opener, _default_redactor)
+
+    def test_a_delimiter_run_an_invisible_character_split_is_reported(self) -> None:
+        # A channel renders both the delimiters and the zero-width character away, so
+        # the halves meet on screen. No pass order is needed for it: the delimiter
+        # pattern matches a SINGLE delimiter, so each `*` goes on its own whether or
+        # not the ZWSP between them has been dropped yet. Pinned as the outcome,
+        # because that is the property, and it holds either way round.
+        assert joins_to_a_credential("AKIAIOSF", "*\u200b*ODNN7EXAMPLE", _default_redactor)
 
     def test_a_cut_inside_a_link_target_is_reported(self) -> None:
         # Caught ONLY by canonicalising each side and then joining. Completing the
@@ -250,10 +359,10 @@ class TestBreakCredentialSeam:
         assert break_credential_seam(prior, text, _default_redactor) == (text, False)
 
     def test_the_tag_alone_can_be_absorbed_so_the_search_keeps_going(self) -> None:
-        # Inserting the tag is the FIRST candidate, not the answer. Here the text
-        # below opens with the ``)`` that closes a link the message above left
-        # open, so the tag lands inside the link target and the join collapses it
-        # away -- putting the key's halves side by side again.
+        # Withholding one character is the first candidate, and it is not always
+        # enough. Here the text below opens with the ``)`` that closes a link the
+        # message above left open, so until that character is withheld the join
+        # collapses the link away -- putting the key's halves side by side again.
         prior, text = "[AKIA](https://ex.test/a,b", ")IOSFODNN7EXAMPLE"
         absorbed = CREDENTIAL_SEAM_TAG + text
         assert joins_to_a_credential(
@@ -266,6 +375,31 @@ class TestBreakCredentialSeam:
         assert safe.startswith(CREDENTIAL_SEAM_TAG)
         assert not joins_to_a_credential(prior, safe, _default_redactor)
         assert ")" not in safe, "the character that closes the link must be withheld"
+
+    def test_the_tag_is_not_allowed_to_answer_its_own_question(self) -> None:
+        """Each candidate is graded WITHOUT the tag, or the tag silences the scan.
+
+        The tag is a redaction placeholder in its own right, so a scanner rule that
+        skips an already-redacted value reads the tag AS the value and stops looking.
+        Graded with the tag in front, a url cut right after ``?token=`` therefore
+        passes on the first candidate with nothing withheld, and the reader is shown
+        the whole token directly under a tag claiming it was held back.
+        """
+        prior = "see https://x.test/collect?token="
+        tail = "aB3xQ9zL7mNpR2sT4vW6yZ8cE1gH5jK0"
+        assert _default_redactor(prior) == prior, "the head half must be clean alone"
+        assert _default_redactor(tail) == tail, "the tail half must be clean alone"
+        assert joins_to_a_credential(prior, tail, _default_redactor), "premise: it joins"
+        # The suppression itself, which is WHY the tagged form cannot be the question.
+        assert not joins_to_a_credential(
+            prior, CREDENTIAL_SEAM_TAG + tail, _default_redactor
+        ), "the tag no longer silences the scan -- re-derive this test"
+
+        safe, broken = break_credential_seam(prior, tail, _default_redactor)
+
+        assert broken
+        assert safe != CREDENTIAL_SEAM_TAG + tail, f"nothing was withheld: {safe!r}"
+        assert tail not in safe, f"the token is still on screen: {safe!r}"
 
     def test_the_withheld_run_is_reported_as_a_redaction(self) -> None:
         # The tag is the redactor's own, so the channel's existing per-message
