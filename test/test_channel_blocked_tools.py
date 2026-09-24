@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kiro_crew.channel import (
+    CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATIONS,
     CHANNEL_AGENT_BLOCKED_DISPATCH_TOOLS,
     CHANNEL_AGENT_BLOCKED_TOOLS,
     _stream_task,
@@ -174,7 +175,37 @@ def test_dispatch_tuple_names_the_verbs_that_start_work():
         "workflow_rerun_subtree",
         "task_run",
         "register_hook",
+        "pod_up",
     }
+
+
+def test_operation_map_names_the_operations_that_start_work():
+    """A passthrough tool is held by operation, so the operations are pinned too.
+
+    ``ops_mission_control_api`` carries a whole API surface behind one name, and
+    only ``POST /rotation/arm`` starts work that outlives the turn: it arms the
+    app's crons, which fire unattended afterwards. Every other operation reads, or
+    writes a record inside the turn, so the tool itself is not on the name list.
+    """
+    assert CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATIONS == {
+        "ops_mission_control_api": (("POST", "/rotation/arm"),),
+    }
+
+
+def test_blocked_operations_are_real_operations_of_their_tool():
+    """A typo here would deny nothing and read as protection.
+
+    The operation is matched against the arguments a caller sends, so a method or
+    path that the tool's own schema does not accept can never match, and the deny
+    would be silently dead. The tool's validator holds the authoritative surface,
+    so the pair is asserted against it rather than against a second spelling.
+    """
+    from kiro_crew.validation import OPS_MISSION_CONTROL_ALLOWED_CALLS
+
+    for tool, operations in CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATIONS.items():
+        assert tool == "ops_mission_control_api", f"no known surface for {tool}"
+        for operation in operations:
+            assert operation in OPS_MISSION_CONTROL_ALLOWED_CALLS, operation
 
 
 @pytest.mark.parametrize(
@@ -188,6 +219,9 @@ def test_dispatch_tuple_names_the_verbs_that_start_work():
         "workflow_list",
         "workflow_cancel",
         "workflow_library_list",
+        "pod_ls",
+        "pod_status",
+        "pod_down",
     ],
 )
 def test_observe_and_teardown_verbs_stay_reachable(tool):

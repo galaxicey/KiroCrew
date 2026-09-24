@@ -55,12 +55,15 @@ _INBOX_POLL_SECS = 1.0
 # part of its turn; ``workflow_run`` and ``workflow_rerun_subtree`` run an
 # orchestration of agents, and ``workflow_author`` exists only to feed them;
 # ``task_run`` starts the autonomous task runner; ``register_hook`` opens a
-# dedicated agent session an external POST drives later.
+# dedicated agent session an external POST drives later; ``pod_up`` boots a
+# whole preview gateway as its own host process on its own port, which keeps
+# serving after the turn that started it has ended.
 #
 # The observe-and-tear-down verbs are deliberately ABSENT, and their absence is
 # the qualifier this invariant needs rather than an omission: ``spawn_list``,
 # ``spawn_status``, ``spawn_release``, ``workflow_status``, ``workflow_result``,
-# ``workflow_list``, ``workflow_cancel`` and ``workflow_library_list`` read or
+# ``workflow_list``, ``workflow_cancel``, ``workflow_library_list``,
+# ``pod_ls``, ``pod_status`` and ``pod_down`` read or
 # end a context that already exists and start no turn.  ``spawn_status`` returns
 # a retained transcript, so how widely that read is scoped is a question about
 # read scope and not about this boundary.
@@ -74,7 +77,27 @@ CHANNEL_AGENT_BLOCKED_DISPATCH_TOOLS: tuple[str, ...] = (
     "workflow_rerun_subtree",
     "task_run",
     "register_hook",
+    "pod_up",
 )
+
+# One tool on the same boundary cannot be held by NAME.  ``ops_mission_control_api``
+# is a passthrough: one tool carrying a whole API surface, most of which reads.
+# ``POST /rotation/arm`` is the operation that starts work outliving the turn --
+# it arms the app's crons, which then fire unattended once the confined turn has
+# ended -- so the deny is keyed on the operation and the tool's read surface stays
+# reachable.  Method and path are the two fields that identify an operation; the
+# tool's own schema admits nothing but an exact member of its allowlist in
+# either, so an operation named here cannot be reached under a second spelling.
+#
+# Enforced at MCP dispatch alone, unlike the name list, which is also matched at
+# the permission-request event: that matcher reads the rendered title, where an
+# operation does not appear.  Containment still holds, because the dispatch guard
+# is what refuses the call -- approving the prompt only means the refusal arrives
+# one step later, and the interactive guard's job is to beat an AUTO-approval,
+# which the dispatch guard beats as well.
+CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATIONS: dict[str, tuple[tuple[str, str], ...]] = {
+    "ops_mission_control_api": (("POST", "/rotation/arm"),),
+}
 
 # Direct-to-user messaging tools a channel agent may never invoke — channel
 # agents communicate exclusively through channel posts.  send_notification
