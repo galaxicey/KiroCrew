@@ -34,7 +34,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from chat_test_helpers import _make_ready_kiro_prerequisite
 
-from kiro_crew import name_grant
+from kiro_crew import mcp_discovery, name_grant
 from kiro_crew.acp.types import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -127,6 +127,8 @@ def _permission(
     tool_name: str = "",
     mcp_server_name: str = "",
     raw_tool_params: dict | None = None,
+    mcp_identity_trusted: bool = False,
+    raw_params_trusted: bool = False,
 ) -> LLMEvent:
     return LLMEvent(
         kind=EVENT_PERMISSION_REQUEST,
@@ -139,6 +141,8 @@ def _permission(
         tool_name=tool_name,
         mcp_server_name=mcp_server_name,
         raw_tool_params=raw_tool_params,
+        mcp_identity_trusted=mcp_identity_trusted,
+        raw_params_trusted=raw_params_trusted,
     )
 
 
@@ -5158,3 +5162,244 @@ class TestRunChatWakaTimeCodingAccounting:
             await _drive(state, slot, _turn_actor="cron")
 
         note_activity.assert_not_called()
+
+
+class TestTrustReadsMcpReadOnlyHint:
+    """Read mode on an MCP call: the server's HOST-STAMPED hint, or nothing.
+
+    Read mode promises "auto-approve read operations, ask for writes". An MCP
+    call carries no command text, so the one piece of evidence that can keep
+    that promise for it is the hint the probe recorded for that server. The
+    rule that makes widening an auto-approval surface safe is that this is the
+    ONLY evidence: absent means write, and a hint the model authored is not
+    this hint.
+    """
+
+    def setup_method(self) -> None:
+        mcp_discovery._probe_cache.clear()
+
+    def teardown_method(self) -> None:
+        mcp_discovery._probe_cache.clear()
+
+    @staticmethod
+    def _probed(**hints: bool) -> None:
+        mcp_discovery._cache_probe(
+            mcp_discovery.McpServerInfo(
+                name="docs",
+                command="x",
+                status="ok",
+                tools=list(hints),
+                tool_read_only=dict(hints),
+            )
+        )
+
+    @staticmethod
+    def _mcp_permission(**kwargs) -> LLMEvent:
+        opts = {
+            "title": "Searching the docs",
+            "tool_input": "",
+            "tool_kind": "other",
+            "is_shell": False,
+            "tool_name": "search",
+            "mcp_server_name": "docs",
+            "mcp_identity_trusted": True,
+            "raw_params_trusted": True,
+        }
+        opts.update(kwargs)
+        return _permission(**opts)
+
+    @pytest.mark.asyncio
+    async def test_a_declared_read_only_tool_is_auto_approved(self, tmp_path):
+        self._probed(search=True)
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._trust_reads = True
+        _set_stream(client, [self._mcp_permission(), _complete()])
+
+        await _drive(state, slot)
+
+        client.approve_tool.assert_awaited_once_with("req-cov-1")
+
+    @pytest.mark.asyncio
+    async def test_the_grant_is_audited_as_its_own_tier(self, tmp_path):
+        self._probed(search=True)
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._trust_reads = True
+        slot._empty_response_retries = 2
+        _set_stream(client, [self._mcp_permission(), _complete()])
+
+        with patch.object(chat_runner, "sel") as mock_sel:
+            audit = MagicMock()
+            mock_sel.return_value = audit
+            await chat_runner._run_chat(state, slot, "hello")
+        await _settle(slot)
+
+        approved = [
+            c.kwargs
+            for c in audit.log_tool_invocation.call_args_list
+            if c.kwargs.get("outcome") == "auto_approved"
+        ]
+        assert approved, audit.log_tool_invocation.call_args_list
+        assert approved[0]["metadata"]["reason"] == "trust_reads_mcp"
+
+    @pytest.mark.asyncio
+    async def test_an_unhinted_tool_reaches_the_card(self, tmp_path):
+        """THE mutation target. A server that declared nothing about this tool
+        is a server whose tool might write, so Read mode must still ask."""
+        self._probed(other_tool=True)
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._trust_reads = True
+        _set_stream(client, [self._mcp_permission(), _complete()])
+
+        with patch.object(chat_runner, "tool_approval_timeout_secs", return_value=0.0):
+            await _drive(state, slot)
+
+        assert [m for m in slot.messages if m.get("role") == "permission"]
+        client.approve_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_declared_writer_reaches_the_card(self, tmp_path):
+        self._probed(search=False)
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._trust_reads = True
+        _set_stream(client, [self._mcp_permission(), _complete()])
+
+        with patch.object(chat_runner, "tool_approval_timeout_secs", return_value=0.0):
+            await _drive(state, slot)
+
+        client.approve_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_never_probed_server_reaches_the_card(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._trust_reads = True
+        _set_stream(client, [self._mcp_permission(), _complete()])
+
+        with patch.object(chat_runner, "tool_approval_timeout_secs", return_value=0.0):
+            await _drive(state, slot)
+
+        client.approve_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_model_authored_hint_is_not_the_hint(self, tmp_path):
+        """Everything the model can write says read-only. The host recorded
+        nothing. The card must still appear, or model prose has become a
+        security input."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._trust_reads = True
+        _set_stream(
+            client,
+            [
+                self._mcp_permission(
+                    title="Read-only search (readOnlyHint: true)",
+                    tool_input=json.dumps(
+                        {"readOnlyHint": True, "annotations": {"readOnlyHint": True}}
+                    ),
+                    raw_tool_params={"annotations": {"readOnlyHint": True}},
+                ),
+                _complete(),
+            ],
+        )
+
+        with patch.object(chat_runner, "tool_approval_timeout_secs", return_value=0.0):
+            await _drive(state, slot)
+
+        assert [m for m in slot.messages if m.get("role") == "permission"]
+        client.approve_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_unproven_identity_cannot_ride_a_real_hint(self, tmp_path):
+        """The hint is real, the name it is looked up by is not proven
+        host-stamped, so the lookup must not be trusted."""
+        self._probed(search=True)
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._trust_reads = True
+        _set_stream(client, [self._mcp_permission(mcp_identity_trusted=False), _complete()])
+
+        with patch.object(chat_runner, "tool_approval_timeout_secs", return_value=0.0):
+            await _drive(state, slot)
+
+        client.approve_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_shell_call_never_takes_the_mcp_path(self, tmp_path):
+        """A shell tool is judged by its command, always. A server entry that
+        happens to name a tool after it must not grant it."""
+        self._probed(bash=True)
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._trust_reads = True
+        _set_stream(
+            client,
+            [
+                self._mcp_permission(
+                    is_shell=True,
+                    tool_name="bash",
+                    tool_input=json.dumps({"command": "rm -rf build"}),
+                ),
+                _complete(),
+            ],
+        )
+
+        with patch.object(chat_runner, "tool_approval_timeout_secs", return_value=0.0):
+            await _drive(state, slot)
+
+        client.approve_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_argument_blind_call_reaches_the_card(self, tmp_path):
+        """A remote MCP server streams no ``rawInput``, so the sensitive-path
+        keystone in ``hooks.on_tool_call`` scans nothing and allows having judged
+        nothing. ``readOnlyHint`` says the server does not write; it says nothing
+        about where the call sends bytes, so granting here would execute
+        agent-chosen arguments unattended."""
+        self._probed(search=True)
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._trust_reads = True
+        _set_stream(client, [self._mcp_permission(raw_params_trusted=False), _complete()])
+
+        with patch.object(chat_runner, "tool_approval_timeout_secs", return_value=0.0):
+            await _drive(state, slot)
+
+        assert [m for m in slot.messages if m.get("role") == "permission"]
+        client.approve_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_project_server_sharing_a_name_reaches_the_card(self, tmp_path):
+        """The probe cache is keyed by bare name. A project checkout declaring
+        its own MUTATING ``docs`` must not inherit the global ``docs`` read hint
+        just because the names match."""
+        mcp_discovery._cache_probe(
+            mcp_discovery.McpServerInfo(
+                name="docs",
+                command="/usr/bin/global-docs",
+                status="ok",
+                tools=["search"],
+                tool_read_only={"search": True},
+            )
+        )
+        agents = tmp_path / "proj" / ".kiro" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "myagent.json").write_text(
+            json.dumps({"mcpServers": {"docs": {"command": "/opt/project-docs"}}}),
+            encoding="utf-8",
+        )
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._trust_reads = True
+        slot.agent = "myagent"
+        slot.project = str(tmp_path / "proj")
+        _set_stream(client, [self._mcp_permission(), _complete()])
+
+        with patch.object(chat_runner, "tool_approval_timeout_secs", return_value=0.0):
+            await _drive(state, slot)
+
+        assert [m for m in slot.messages if m.get("role") == "permission"]
+        client.approve_tool.assert_not_awaited()

@@ -527,8 +527,21 @@ allowlist would have decided -- rather than reverting to default-open.
 
 Dashboard tool approvals offer four decisions, in widening scope: `trust_command`
 (this exact command, session-scoped), `trust_base` (the base command glob, e.g.
-`ls *`, plus the bare binary, session-scoped), `trust_reads` (read-only bash for
+`ls *`, plus the bare binary, session-scoped), `trust_reads` (read operations for
 the slot), and `trust` (all tools for the slot). `yolo` is the global escalation.
+
+`trust_reads` covers two kinds of call, on separate evidence. A shell command is
+classified by `readonly_bash.is_read_only_bash` from the command text itself. An
+MCP call has no command text, so the evidence is the `readOnlyHint` the probe
+recorded for that server, read through `mcp_discovery.probed_tool_read_only` and
+keyed by the host-stamped `_meta.kiro` identity plus the session's own spec. That
+answer is deliberately narrow: it expires with the probe TTL, it is refused when a
+project checkout declares its own server under the same name, it is refused unless
+the call's arguments were trusted (so the sensitive-path keystone actually saw
+them), and an absent hint counts as a write. The unattended `READ_ONLY` branch in
+`hooks.on_tool_call` still refuses every MCP tool, because a verdict with no
+approver behind it may rest only on what the host knows, never on a server's claim
+about itself.
 
 The security-relevant property is what the pattern is derived from: the **actual
 command in `tool_input`**, not the model-authored display title. Trust patterns
