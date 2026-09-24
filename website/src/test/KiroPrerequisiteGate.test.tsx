@@ -224,7 +224,7 @@ describe('KiroPrerequisiteGate', () => {
     expect(screen.queryByRole('button', { name: 'Sign in to Kiro' })).not.toBeInTheDocument()
     expect(screen.queryByText(/unverified executable/)).not.toBeInTheDocument()
     // A PATH install: bare commands, nothing muted, no bundled-copy hint.
-    expect(screen.queryByText(/built into the desktop app/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Kiro CLI from the desktop app/)).not.toBeInTheDocument()
   })
 
   it('explains then mutes the shared bundled path', async () => {

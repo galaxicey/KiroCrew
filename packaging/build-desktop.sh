@@ -1111,7 +1111,7 @@ print(p["sha256"])' "$cache/manifest.json" "$file")"
   # Build-time gate: the staged copy must actually run on this host class, in a
   # clean room -- empty HOME, minimal PATH -- so no user install on the build
   # machine can answer for it (the launcher used to pass this gate that way).
-  # Two probes: `--version`, then one ACP `initialize` round trip over stdio,
+  # Three probes: `--version`, `login --help`, then one ACP `initialize` round trip,
   # the call every Kiro Crew session opens with. A binary that answers it here,
   # alone in its directory, is self-contained on THIS platform, which is the
   # premise the resolver rests on when it hands sessions exactly this file.
@@ -1130,10 +1130,17 @@ print(p["sha256"])' "$cache/manifest.json" "$file")"
     # Native Python does not perform Git Bash's MSYS path conversion.
     probe_binary="$(cygpath -w "$probe_binary")"
   fi
-  if ! HOME="$clean_home" USERPROFILE="$clean_home" PATH="$clean_path" \
+  if ! HOME="$clean_home" USERPROFILE="$clean_home" KIRO_NO_AUTO_UPDATE=1 PATH="$clean_path" \
     "$dest/$entry" --version >/dev/null 2>&1; then
     rm -rf "$clean_home"
     echo "ERROR: staged kiro-cli does not execute" >&2; exit 1
+  fi
+  # `login` is the command the setup gate gives a fresh machine. Prove the
+  # staged entry accepts the device-flow flag without starting a network login.
+  if ! HOME="$clean_home" USERPROFILE="$clean_home" KIRO_NO_AUTO_UPDATE=1 PATH="$clean_path" \
+    "$dest/$entry" login --help 2>/dev/null | grep -q -- '--use-device-flow'; then
+    rm -rf "$clean_home"
+    echo "ERROR: staged kiro-cli does not accept login --use-device-flow" >&2; exit 1
   fi
   if ! python3 - "$probe_binary" "$clean_home" <<'PY'
 import json, os, queue, subprocess, sys, threading, time
@@ -1152,10 +1159,11 @@ proc = subprocess.Popen(
             **os.environ,
             "HOME": home,
             "USERPROFILE": home,
+            "KIRO_NO_AUTO_UPDATE": "1",
             "PATH": os.environ.get("PATH", ""),
         }
         if os.name == "nt"
-        else {"HOME": home, "PATH": "/usr/bin:/bin"}
+        else {"HOME": home, "KIRO_NO_AUTO_UPDATE": "1", "PATH": "/usr/bin:/bin"}
     ),
 )
 proc.stdin.write(request)

@@ -642,13 +642,18 @@ class TestKiroPrerequisiteHelpers:
 
         assert resolved == str(forced)
 
-    def test_bundled_login_command_carries_the_absolute_path(self, tmp_path: Path) -> None:
+    def test_bundled_login_command_carries_the_absolute_path(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """A bundled resolution serves sign-in commands the user can actually
         run: the bundled copy is not on their shell PATH, and the macOS
         resources path contains a space, so the path must be quoted."""
         bundled_dir = tmp_path / "Kiro Res" / "kiro-cli"
         binary = bundled_dir / BUNDLED_KIRO_CLI_ENTRY
         _make_executable(binary)
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
 
         login, sso, bundled = login_commands_for(
             str(binary), {"KIROCREW_BUNDLED_KIRO_DIR": str(bundled_dir)}

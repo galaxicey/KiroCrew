@@ -311,8 +311,8 @@ const SANDBOX_DOCS_URL =
  *
  * The whole block is the target rather than a small trailing glyph: this command
  * has to be retyped on the gateway host, and one typo restarts the loop the user
- * is already stuck in. The glyph stays faintly visible instead of appearing only
- * on hover, because a recovery screen is the wrong place to hide an affordance.
+ * is already stuck in. The glyph uses the muted token at full weight, not faded
+ * or hover-only, because a recovery screen is the wrong place to hide an affordance.
  *
  * The text is read back out of the DOM rather than taken as a prop. A command is
  * not translatable copy, and the i18n gate's exemption covers a literal that is
@@ -359,7 +359,7 @@ function CopyCommand({ children }: { children: ReactNode }) {
       {copied ? (
         <Check className="lucide-inline shrink-0 text-ok" />
       ) : (
-        <Copy className="lucide-inline shrink-0 text-muted opacity-50 transition-opacity group-hover/cmd:opacity-100" />
+        <Copy className="lucide-inline shrink-0 text-muted transition-colors group-hover/cmd:text-text" />
       )}
     </button>
   )

@@ -215,6 +215,9 @@ Two properties are load-bearing and worth knowing before you touch that lane:
   than assuming it equals the runner's glibc. The AppImage links against
   it, which is why both Linux legs stay on 22.04 (glibc 2.35) rather than moving
   to 24.04 (2.39) — the newer floor would exclude AL2023, Debian 12 and RHEL 9.
+  The bundled kiro-cli 2.24.0 stays inside that floor: `kiro-cli-chat` requires
+  `GLIBC_2.34` on x86_64 and `GLIBC_2.30` on aarch64, so it does not narrow the
+  supported distro set. Re-measure both pinned zips when updating the CLI pin.
 
 **Building your own package locally.** `make desktop` needs no arch flags: it
 detects the host and emits an AppImage for it, so running it on an ARM box
