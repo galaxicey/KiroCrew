@@ -100,7 +100,14 @@ async def api_member_capabilities(request: web.Request) -> web.Response:
             )
         return web.json_response(result)
     except CapabilityError as exc:
-        return web.json_response({"error": exc.code, "code": exc.code}, status=exc.status)
+        refusal: dict[str, object] = {"error": exc.code, "code": exc.code}
+        if exc.keys:
+            # Key NAMES and the file's basename only, already bounded by the
+            # service: the pane names the settings a refusal is about instead
+            # of sending the user hunting.
+            refusal["keys"] = list(exc.keys)
+            refusal["file"] = exc.file
+        return web.json_response(refusal, status=exc.status)
     except (OSError, ValueError):
         # Source/sidecar/parser errors may quote secret-bearing bytes or paths.
         return web.json_response(

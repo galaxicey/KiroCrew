@@ -137,7 +137,9 @@
     "parentChange_changed": "Le parent a modifié ceci",
     "discardDraftTitle": "Abandonner le brouillon des Capacités ?",
     "discardDraftBody": "Abandonner les modifications de capacités de {{name}} laisse l’éditeur ouvert. Les valeurs enregistrées et les identifiants masqués ne changent pas. Aucun autre membre n’est concerné.",
-    "discardDraftConfirm": "Abandonner le brouillon"
+    "discardDraftConfirm": "Abandonner le brouillon",
+    "driftHint": "Le fichier d'agent a été modifié en dehors de cette page. Appuie sur Vérifier les modifications ci-dessous pour voir cette modification externe ; Enregistrer écrit ensuite la réparation et les nouvelles discussions redémarrent.",
+    "unreviewableDrift": "Le fichier d'agent {{file}} a été modifié dans {{keys}}, un paramètre que cette page ne peut pas afficher, il ne peut donc pas être enregistré depuis ici. Modifie ou annule {{keys}} dans {{file}} du dossier des agents, puis rouvre cette page."
   },
   "api": {
     "client": {
@@ -10081,7 +10083,9 @@
         "sign_in_hint": "Ouvrez Paramètres → Aperçu → Connexion Kiro, reconnectez-vous, puis renvoyez votre message.",
         "feature_request_form": "Ouvrir le formulaire de demande de fonctionnalité",
         "feature_request_form_hint": "Ton quota mensuel est épuisé — dépose plutôt ta demande sur GitHub avec ce formulaire. Ce formulaire contourne l’agent : il ouvre le formulaire d’issue GitHub que tu remplis toi-même et ne consomme rien de ton quota mensuel.",
-        "session_start_repeat_hint": "La session de l’agent n’a pas pu démarrer plusieurs fois de suite ; reprendre ne ferait que relancer le même démarrage. Redémarre le gateway depuis un terminal avec {{command}}, puis renvoie ton message."
+        "session_start_repeat_hint": "La session de l’agent n’a pas pu démarrer plusieurs fois de suite ; reprendre ne ferait que relancer le même démarrage. Redémarre le gateway depuis un terminal avec {{command}}, puis renvoie ton message.",
+        "capabilities_changed": "Le fichier d'agent de ce membre de la crew a été modifié en dehors de la page Capabilities, donc les nouvelles discussions ne peuvent pas démarrer. Ouvre Capabilities, vérifie la modification et enregistre-la, puis démarre une nouvelle discussion.",
+        "open_capabilities": "Ouvrir Capabilities"
       },
       "folderPanel": {
         "clear_search": "Effacer la recherche",
