@@ -146,11 +146,24 @@ def _find_cli() -> list[str]:
 # first and a tamper pin second, and it is an env var rather than a config pair
 # so no config precedence applies to it at all. ``update_governance`` and
 # ``auto_improvement``'s clone setup already pin it for the same reason.
+#
+# GIT_OPTIONAL_LOCKS is the other non-config pin, and it is about WHAT GIT WRITES
+# on a read. ``git status`` refreshes the index's stat cache and saves it back,
+# taking ``index.lock`` to do so, which makes a command that is a read to its
+# caller a WRITE to the repository. Every fleet render runs one per row, so
+# against a checkout this app may only read the guarantee would break on the
+# ordinary path, and against this product's own checkout the fleet contends with
+# the operator's git for the lock. Set to ``0`` here rather than as a
+# ``--no-optional-locks`` flag per call site so the argv this handler builds stays
+# the subcommand it names, and so a read added later inherits it. Nothing this
+# handler needs is lost: the porcelain answer is identical, and a real mutation
+# still takes the locks it REQUIRES.
 # Harmless for non-git commands (pip/npm ignore GIT_*).
 _GIT_ENV_NEUTRALIZERS: dict[str, str] = {
     "GIT_ALLOW_PROTOCOL": "https:ssh",
     "GIT_PROTOCOL_FROM_USER": "0",
     "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
     "GIT_CONFIG_COUNT": "4",
     "GIT_CONFIG_KEY_0": "core.fsmonitor",
     "GIT_CONFIG_VALUE_0": "false",
@@ -433,6 +446,40 @@ def _toolchain_bin(name: str) -> str | None:
     return find_node_tool(name, _TRUSTED_PATH) or _trusted_bin(name)
 
 
+async def _capture_bounded(
+    proc, cap: int, kill: "Callable[[], Awaitable[None]]"
+) -> tuple[bytes, bytes, bool]:
+    """Read both pipes CONCURRENTLY, stopping once either passes *cap*.
+
+    Concurrently, because a child writing hard to one pipe blocks forever when the
+    other is not drained -- that is what ``communicate`` exists to avoid, and a naive
+    sequential bounded read reintroduces it as a hang.
+
+    The reader that overflows KILLS the child before returning, so the sibling pipe
+    reaches EOF at once instead of waiting out the whole timeout for a child that is
+    blocked writing into a pipe nobody is reading.
+    """
+    overflowed = False
+
+    async def _one(stream) -> bytes:
+        nonlocal overflowed
+        if stream is None:
+            return b""
+        buf = bytearray()
+        while True:
+            chunk = await stream.read(65536)
+            if not chunk:
+                return bytes(buf)
+            buf.extend(chunk)
+            if len(buf) > cap:
+                overflowed = True
+                await kill()
+                return bytes(buf[:cap])
+
+    out, err = await asyncio.gather(_one(proc.stdout), _one(proc.stderr))
+    return out, err, overflowed
+
+
 async def _run_cmd(
     cmd: list[str],
     *,
@@ -441,6 +488,7 @@ async def _run_cmd(
     timeout: int = 30,
     mode: str = "standard",
     pre_spawn: Callable[[], Awaitable[str | None]] | None = None,
+    max_output_bytes: int | None = None,
 ) -> tuple[int, str, str]:
     """Run a subprocess asynchronously, return (returncode, stdout, stderr).
 
@@ -526,8 +574,24 @@ async def _run_cmd(
                 pass
         return -1, "", f"spawn failed: {exc}"
     try:
+
+        async def _reap() -> None:
+            await _kill_tree(proc.pid)
+            await platform_compat.kill_and_reap(proc)
+
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            if max_output_bytes is None:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            else:
+                # Bounded for a read whose SUBJECT is repository-controlled: a foreign
+                # commit message has no size this app agreed to, and `communicate`
+                # would hold all of it in the gateway before any check could look.
+                stdout, stderr, overflowed = await asyncio.wait_for(
+                    _capture_bounded(proc, max_output_bytes, _reap), timeout=timeout
+                )
+                if overflowed:
+                    await _reap()
+                    return -1, "", f"output passed the {max_output_bytes}-byte bound"
         except asyncio.TimeoutError:
             await _kill_tree(proc.pid)
             await platform_compat.kill_and_reap(proc)
