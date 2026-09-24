@@ -1010,12 +1010,26 @@ class CancellationCoordinator(ManagerComponent):
             info.result = info.streaming_text
         # _force_reap emits the (single) stopped-aware ``subagent_done`` event
         # and drives _on_done delivery — no second event here.
-        await self._manager._force_reap(
-            agent_id,
-            info,
-            time.time() - info.started,
-            reason=info._reap_reason,
+        #
+        # Run as a TRACKED task, awaited here: this reap lives in the caller's
+        # task (a request handler, a parent's teardown), which ``cancel_all``
+        # does not know. Tracked, a gateway shutdown cancels it beside the
+        # reaper task, so its cancellation arm finishes the record and releases
+        # the report inside the drain instead of sitting in a hanging reset
+        # until the shutdown budget hard-exits the process. Awaiting the task
+        # keeps the caller's own cancellation reaching the reap as before
+        # (cancelling an awaiter cancels the future it waits on).
+        reap = asyncio.ensure_future(
+            self._manager._force_reap(
+                agent_id,
+                info,
+                time.time() - info.started,
+                reason=info._reap_reason,
+            )
         )
+        self._manager._reap_tasks.add(reap)
+        reap.add_done_callback(self._manager._reap_tasks.discard)
+        await reap
         return True
 
     async def cancel_all_impl(self) -> None:
@@ -1044,6 +1058,20 @@ class CancellationCoordinator(ManagerComponent):
         if self._manager._reaper_task and not self._manager._reaper_task.done():
             self._manager._reaper_task.cancel()
             self._manager._reaper_task = None
+        # The reaps that live outside the reaper task (a Stop, a parent-end
+        # cancel, each awaited in its caller's task) are cancelled the same way
+        # and gathered here, so each one's cancellation arm has finished the
+        # record and released its report before the run tasks are cancelled and
+        # the reports drained. Left alone, such a reap sat in its hanging reset
+        # with its report waiting on a gate nobody released, and the gateway's
+        # shutdown budget hard-exited the process before the drain could abandon
+        # it -- the tombstone its run's arm wrote then excluded the folder from
+        # orphan recovery, so the parent never received the completion.
+        inflight_reaps = [t for t in self._manager._reap_tasks if not t.done()]
+        for reap in inflight_reaps:
+            reap.cancel()
+        if inflight_reaps:
+            await asyncio.gather(*inflight_reaps, return_exceptions=True)
         # Follow-up watchers are cancelled and gathered before announcing.
         # The announce awaits — _on_done injection can be slow — and
         # a busy-retry watcher waking during that await could dispatch a

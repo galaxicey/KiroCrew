@@ -1101,6 +1101,12 @@ def test_no_raw_cancel_outside_chokepoint():
     allowed_substrings = (
         "task.cancel()",  # chokepoint body — verified below to be unique
         "self._reaper_task.cancel()",
+        # A ``_force_reap`` running outside the reaper loop (a Stop, a parent-end
+        # cancel), tracked in ``_reap_tasks`` and cancelled by ``cancel_all`` the
+        # way the reaper task is: the reap is the reaper's own work, not a
+        # managed run -- the run it tears down is cancelled through the
+        # chokepoint inside ``_force_reap`` -- so no terminal marker applies.
+        "reap.cancel()",
         # A reap supersedes a pending respawn; the recovery task schedules the
         # respawn and is NOT a managed run, so no terminal marker applies.
         "recovery_task.cancel()",
