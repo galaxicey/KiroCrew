@@ -163,6 +163,7 @@ from kiro_crew.subagent_persistence import (
     prune_stale_tombstones,
     read_state,
     record_slow_command,
+    settle_delivered_batch,
     update_state,
     write_result_chunk,
     write_tombstone,
@@ -4440,8 +4441,8 @@ class SubagentManager:
     async def settle_queued_delivery(self, agent_ids: list[str]) -> None:
         return await self._waves.settle_queued_delivery_impl(agent_ids)
 
-    def _settle_digest_holds(self, info: SubagentInfo) -> None:
-        return self._waves._settle_digest_holds_impl(info)
+    async def _settle_digest_holds(self, info: SubagentInfo) -> None:
+        return await self._waves._settle_digest_holds_impl(info)
 
     def get(self, agent_id: str) -> SubagentInfo | None:
         return self._run_events.get_impl(agent_id)
@@ -4886,6 +4887,7 @@ _COMPONENT_GLOBAL_BINDINGS = (
     redact_exfiltration_urls,
     run_in_embed_pool,
     sel,
+    settle_delivered_batch,
     single_completion_meta,
     stage_boundary_owner_for_run,
     subprocess_executor,
