@@ -186,7 +186,83 @@ NOT seed a first message: that would be delivery.
 `session_create` also takes an optional `folder` — a folder id or `/`-separated
 human path, resolved with `chat_folder_create`'s `parent` semantics (missing
 segments created, behind the same tree-shaping gate) — and files the slot as
-part of creation (#6118). The caller's OWN slot is filed the same way with
+part of creation (#6118). A folder's project binding is agent-settable too —
+`chat_folder_create`'s `project_dir`, or `chat_folder_update` on an existing
+folder (#10432), both running the folder endpoint's own validator, never a copy —
+and a chat the person opens in a bound folder (`POST /api/chat/slots`) inherits
+the nearest ancestor's `project_dir` at creation, before its context is built.
+That endpoint refuses a UNC-shaped `project_dir` (`\\host\share`, `//host/share`,
+`\\?\UNC\host\share`) lexically, before its first filesystem call, through the
+repo's one UNC gate (`is_unc_shape` with the `unc_probe_allowed` allowance) —
+on a Windows gateway `realpath` on such text opens an SMB connection to the
+named host, an outbound credential probe — and refuses the shape on every host,
+since path text is untrusted everywhere; the two folder tools run the same
+helper (`project_dir_unc_refusal`) before posting, so the text never travels
+and the agent reads the endpoint's own refusal without a round trip. The rule is
+ADMISSION-only: it runs where a request names a directory — the folder create
+and update routes and the scaffold's scan root (`_admit_project_dir`), the
+`set_project` directive and `POST /api/chat/slots/{slot}/project` (the same
+helper, before their own `realpath`), and the tools' pre-check — and never on
+the read path. `_validate_project_dir` is also the stored-value reader
+(`_resolve_folder_project_dir`, on slot create and agent switch), and a folder
+bound to a share before the rule existed is a binding to honour, not a request
+to admit: refusing it there would fail every chat opened in that folder with a
+400 and drop the agent to the workspace default, a retroactive refusal with no
+migration; a stored value resolves exactly as it did.
+`chat_folder_update` clears a binding with `project_dir: ""`, and reads a JSON
+`null` as that same clear (never as the string `"None"`). A session already
+filed in the folder is not re-scoped by the change itself: it picks up the
+folder's current binding on its next agent switch — `api_chat_slot_agent`
+re-resolves the slot's folder chain through the create path's helper on every
+switch to a non-project-scope agent — and immediately through `set_project`.
+That reach is why the PATCH refuses an app's or member's `project_dir` change on
+an EXISTING folder outright (403 `folder_project_dir_forbidden`, before the
+path is validated), even on a folder it created that holds only its own folders:
+the sessions a binding reaches live in the slot table and the session archive,
+neither sharing a lock with the folder store, the archive's index carries no
+owner, and a session revives with its `folder_id` intact — so "every session
+under this folder is the caller's own" cannot be established atomically with
+the write (the same seam that refuses an app's folder delete). An agent
+principal binds a folder at CREATE, when nothing is filed in it; changing an
+existing binding is the person's. The reparent path is bound by the same rule:
+an unbound folder's subtree inherits its nearest bound ancestor, so an agent
+principal's `parent_id` change is refused (same 403, decided under the store
+lock) when the stored binding the moved folder inherits at its current place
+differs from the one at its destination — moving under a folder it bound at
+create, or out from under a binding, would rebind the person's chats filed
+inside it; a folder with a binding of its own moves freely, and so does a move
+between places with the same inherited binding. A channel caller — a Channels
+agent (`channel:<channel_id>:<agent_id>`) or a session driven from a messaging
+transport (`slack:`, `discord:`, every namespace in `CHANNEL_SESSION_NAMESPACES`,
+recognised through `messaging.link.is_channel_session_key`, never re-listed) —
+is refused a binding on all three paths with the same 403 — `project_dir` on the
+create, set-or-clear on the PATCH, and a reparent across a binding — because
+its key names no slot and no app, so `folder_principal` would otherwise read it
+as the person. The three binding fences key on ONE binding principal, derived
+once per request (`_binding_principal`: the folder principal when set, else the
+caller's own key when it is a channel caller's, else the person), so they cannot
+disagree on who is confined; the ownership fences stay on the folder principal,
+which is why a channel caller may still reparent the person's folders between
+places with the same binding. The reparent branch compares what the moved
+subtree would inherit for STEERING as well (`_inherited_steering_dirs`: the
+stored declarations of every ancestor, root-first, with each declaring folder's
+owner — the data `_resolve_folder_steering_dirs` consumes, compared under the
+same lock and validation-free like the binding walk), and refuses an agent
+principal's move that changes it with the steering gate's 403
+(`steering_dirs_forbidden`): an agent principal may not declare steering, and a
+move under a folder that declares it, or out from under one, would hand those
+documents to — or take them from — every chat filed in the moved subtree at its
+next start, while the binding branch is silent whenever both places inherit the
+same binding. A move between places that inherit the same steering lands. The
+set-or-clear refusal comes before the path is looked at. The `steering_dirs`
+principal gate at both of its write sites (`_refuse_principal_steering_dirs`,
+spec'd in `config.md`) keys on the same binding principal: a steering
+declaration is a gateway host-file read, the same gap class as a binding, so a
+channel caller is refused it the way an app or crew member is, with that gate's
+own 403 (`steering_dirs_forbidden`).
+`session_create` itself still resolves the child's project from the caller's
+workspace (`default_project_dir`), not from the folder it files into; #11680
+adds that inheritance. The caller's OWN slot is filed the same way with
 `chat_folder_file_self` (folder tools, same server): it takes no `session`
 argument, resolves the target from the verified caller key, and so can be
 granted where `chat_folder_move_session` is withheld — a conductor files itself

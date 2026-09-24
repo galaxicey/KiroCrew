@@ -56,6 +56,7 @@ from kiro_crew.dashboard.chat_delivery import (
 from kiro_crew.dashboard.chat_folders import (
     _resolve_folder_project_dir,
     _unhide_folder,
+    project_dir_unc_refusal,
 )
 from kiro_crew.dashboard.chat_orchestrator import (
     _cancel_stage_subagents,
@@ -9985,6 +9986,22 @@ async def api_chat_slot_project(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     if project:
+        # Lexical, before ``realpath``: a UNC-shaped project makes a Windows
+        # gateway's ``realpath`` open an SMB connection to a host the caller
+        # named. The folder endpoint's own helper decides -- one rule for every
+        # site where request-named path text is admitted (the folder routes,
+        # the set_project directive, this endpoint) -- in that validator's 400
+        # shape, audited like the sensitive-path refusal below.
+        unc_err = project_dir_unc_refusal(project)
+        if unc_err:
+            sel().log_api_access(
+                caller=request.get("user", "dashboard"),
+                operation="chat_slot_project",
+                outcome="denied",
+                resources=f"slot={name} project={project}",
+                error="UNC path",
+            )
+            return web.json_response({"error": unc_err, "code": "project_unc_path"}, status=400)
         project = os.path.realpath(os.path.expanduser(project))
         if not os.path.isdir(project):
             return web.json_response({"error": "Not a directory"}, status=400)

@@ -12,6 +12,7 @@ claim, so an app agent's tool call arrives with ``request["app"]`` empty.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -19,7 +20,11 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from kiro_crew.constants import CHANNEL_SESSION_NAMESPACES
 from kiro_crew.dashboard.chat_folders import (
+    _admit_project_dir,
+    _inherited_steering_dirs,
+    _resolve_folder_project_dir,
     api_chat_folder_create,
     api_chat_folder_delete,
     api_chat_folder_update,
@@ -449,6 +454,894 @@ class TestRenameAndReparentAreBounded:
             )
         assert resp.status == 200
         assert _by_id(state, PERSON)["parent_id"] == OTHER
+
+
+class TestAnAppCannotChangeAnExistingFoldersProjectDir:
+    """A folder's binding is what every session filed in its subtree picks up
+    on its next agent switch, and those sessions live in stores the folder store
+    shares no lock with (the slot table, the session archive). "Every session
+    under this folder is the caller's own" cannot be established atomically with
+    the write, so the PATCH refuses an agent principal's ``project_dir`` change
+    outright -- the delete route's rule, on the binding axis. An agent principal
+    binds a folder at CREATE, when nothing is filed in it yet; the person keeps
+    the update they always had.
+    """
+
+    @staticmethod
+    def _radar_holding_theirs(bound: str = "") -> list[dict[str, Any]]:
+        folders = _folders()
+        if bound:
+            next(f for f in folders if f["id"] == RADAR)["project_dir"] = bound
+        folders.append({"id": "fldr00000007", "name": "Theirs", "parent_id": RADAR})
+        return folders
+
+    @pytest.mark.asyncio
+    async def test_an_app_cannot_rebind_its_folder_holding_the_persons_chat(self, tmp_path) -> None:
+        """The person filed one of their own chats into the app's folder. That
+        slot re-resolves the folder's binding on its next agent switch
+        (``api_chat_slot_agent``), so an app rebinding the folder would decide
+        the person's project, cwd and steering -- cross-ownership through a
+        session the folder store cannot see atomically."""
+        theirs = _ChatSlot("chat-2-200")
+        theirs.folder_id = RADAR
+        state = _state(_app_slot("chat-1-100", "issue-radar"), theirs)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{RADAR}",
+                json={"project_dir": str(tmp_path)},
+                headers={"X-Session-Key": "dashboard:chat-1-100"},
+            )
+            body = await resp.json()
+        assert resp.status == 403
+        assert body["code"] == "folder_project_dir_forbidden"
+        assert "project_dir" not in _by_id(state, RADAR)
+
+    @pytest.mark.asyncio
+    async def test_binding_own_folder_that_holds_a_foreign_one_is_refused(self, tmp_path) -> None:
+        """The nested-folder case is one instance of the same rule: a chat the
+        person opens in the nested folder would inherit the app's binding."""
+        state = _state(_app_slot("chat-1-100", "issue-radar"), folders=self._radar_holding_theirs())
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{RADAR}",
+                json={"project_dir": str(tmp_path)},
+                headers={"X-Session-Key": "dashboard:chat-1-100"},
+            )
+            body = await resp.json()
+        assert resp.status == 403
+        assert body["code"] == "folder_project_dir_forbidden"
+        assert "project_dir" not in _by_id(state, RADAR)
+
+    @pytest.mark.asyncio
+    async def test_clearing_is_refused_the_same_way(self, tmp_path) -> None:
+        """Clearing changes what a filed session picks up just as setting does."""
+        state = _state(
+            _app_slot("chat-1-100", "issue-radar"),
+            folders=self._radar_holding_theirs(bound=str(tmp_path)),
+        )
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{RADAR}",
+                json={"project_dir": ""},
+                headers={"X-Session-Key": "dashboard:chat-1-100"},
+            )
+        assert resp.status == 403
+        assert _by_id(state, RADAR)["project_dir"] == str(tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_even_a_subtree_of_only_its_own_folders_and_sessions_is_refused(
+        self, tmp_path
+    ) -> None:
+        """No narrower rule: an own-folders-only subtree with only the app's own
+        live session filed in it is refused too, because the archive (no owner
+        in its index, sessions revive with ``folder_id`` intact) and a filing
+        that lands mid-request are exactly what the folder store cannot see.
+        Nothing is stored and the path is never validated."""
+        folders = _folders()
+        folders.append(
+            {"id": "fldr00000007", "name": "Runs", "parent_id": RADAR, "owner_app": "issue-radar"}
+        )
+        own = _app_slot("chat-1-100", "issue-radar")
+        own.folder_id = RADAR
+        state = _state(own, folders=folders)
+        with patch("kiro_crew.dashboard.chat_folders._validate_project_dir") as validator:
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.patch(
+                    f"/api/chat/folders/{RADAR}",
+                    json={"project_dir": str(tmp_path)},
+                    headers={"X-Session-Key": "dashboard:chat-1-100"},
+                )
+                body = await resp.json()
+        assert resp.status == 403
+        assert body["code"] == "folder_project_dir_forbidden"
+        assert "bind it when creating the folder" in body["error"]
+        assert "project_dir" not in _by_id(state, RADAR)
+        validator.assert_not_called()
+        state.mutate_folders.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_audited(self, tmp_path) -> None:
+        state = _state(_app_slot("chat-1-100", "issue-radar"))
+        with patch("kiro_crew.dashboard.chat_folders.sel") as sel_fn:
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.patch(
+                    f"/api/chat/folders/{RADAR}",
+                    json={"project_dir": str(tmp_path)},
+                    headers={"X-Session-Key": "dashboard:chat-1-100"},
+                )
+        assert resp.status == 403
+        kwargs = sel_fn.return_value.log_api_access.call_args.kwargs
+        assert kwargs["caller"] == "issue-radar"
+        assert kwargs["operation"] == "chat.folder_update"
+        assert kwargs["outcome"] == "denied"
+        assert kwargs["resources"] == RADAR
+        assert "project directory" in kwargs["error"]
+
+    @pytest.mark.asyncio
+    async def test_an_apps_other_fields_on_its_own_folder_still_apply(self, tmp_path) -> None:
+        """The rule is about the binding only: a rename of the same folder by
+        the same app lands as before."""
+        state = _state(_app_slot("chat-1-100", "issue-radar"))
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{RADAR}",
+                json={"name": "Radar runs"},
+                headers={"X-Session-Key": "dashboard:chat-1-100"},
+            )
+        assert resp.status == 200
+        assert _by_id(state, RADAR)["name"] == "Radar runs"
+
+    @pytest.mark.asyncio
+    async def test_the_person_can_bind_a_folder_holding_an_apps(self, tmp_path) -> None:
+        folders = _folders()
+        folders.append(
+            {
+                "id": "fldr00000007",
+                "name": "Radar sub",
+                "parent_id": PERSON,
+                "owner_app": "issue-radar",
+            }
+        )
+        state = _state(_ChatSlot("chat-1-100"), folders=folders)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{PERSON}",
+                json={"project_dir": str(tmp_path)},
+                headers={"X-Session-Key": "dashboard:chat-1-100"},
+            )
+        assert resp.status == 200
+        assert _by_id(state, PERSON)["project_dir"] == str(tmp_path.resolve())
+
+    @pytest.mark.asyncio
+    async def test_the_path_validator_runs_off_the_event_loop(self, tmp_path) -> None:
+        """realpath/isdir on a stalled network path must not hold the gateway
+        loop: the PATCH route hands the validator to a worker thread, as the
+        create route does."""
+        state = _state(_ChatSlot("chat-1-100"))
+        seen: list[Any] = []
+        real_to_thread = asyncio.to_thread
+
+        async def _spy(fn: Any, *args: Any, **kwargs: Any) -> Any:
+            seen.append(fn)
+            return await real_to_thread(fn, *args, **kwargs)
+
+        with patch("kiro_crew.dashboard.chat_folders.asyncio.to_thread", side_effect=_spy):
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.patch(
+                    f"/api/chat/folders/{PERSON}",
+                    json={"project_dir": str(tmp_path)},
+                    headers={"X-Session-Key": "dashboard:chat-1-100"},
+                )
+        assert resp.status == 200
+        # The admission validator (UNC pre-check, then ``_validate_project_dir``)
+        # is what the route hands to the worker thread.
+        assert _admit_project_dir in seen
+
+
+class TestAChannelAgentCannotBindAFolder:
+    """A Channels agent (session key ``channel:<channel_id>:<agent_id>``) acts on
+    words from a thread other people are in. Its key names no dashboard slot and
+    no app, so ``folder_principal`` reads it as the PERSON -- and the app/member
+    fence on the two binding paths is keyed on that principal. Without a fence
+    of its own, a channel agent could bind a new folder or rebind an existing
+    one with the person's full authority. Both paths refuse it with the same 403
+    the agent-principal fence answers; the person's authority is untouched, and
+    a channel agent's other folder writes are not this rule's concern.
+    """
+
+    CHANNEL = "channel:chan-000001:helper"
+
+    @pytest.mark.asyncio
+    async def test_a_channel_agent_cannot_create_a_bound_folder(self, tmp_path) -> None:
+        state = _state(_ChatSlot("chat-1-100"))
+        before = len(state._folders)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/folders",
+                json={"name": "Runs", "project_dir": str(tmp_path)},
+                headers={"X-Session-Key": self.CHANNEL},
+            )
+            body = await resp.json()
+        assert resp.status == 403
+        assert body["code"] == "folder_project_dir_forbidden"
+        assert len(state._folders) == before
+
+    @pytest.mark.asyncio
+    async def test_a_channel_agent_cannot_change_an_existing_folders_binding(
+        self, tmp_path
+    ) -> None:
+        """Set AND clear: the person's own folder, which a channel key would
+        otherwise reach as the person."""
+        folders = _folders()
+        bound = {"id": "fldr00000008", "name": "Bound", "parent_id": "", "project_dir": "/t"}
+        folders.append(bound)
+        state = _state(_ChatSlot("chat-1-100"), folders=folders)
+        with patch(
+            "kiro_crew.dashboard.chat_folders._validate_project_dir",
+            return_value=(str(tmp_path), None),
+        ) as validator:
+            async with TestClient(TestServer(_make_app(state))) as client:
+                setting = await client.patch(
+                    f"/api/chat/folders/{PERSON}",
+                    json={"project_dir": str(tmp_path)},
+                    headers={"X-Session-Key": self.CHANNEL},
+                )
+                set_body = await setting.json()
+                clearing = await client.patch(
+                    "/api/chat/folders/fldr00000008",
+                    json={"project_dir": ""},
+                    headers={"X-Session-Key": self.CHANNEL},
+                )
+        assert (setting.status, clearing.status) == (403, 403)
+        assert set_body["code"] == "folder_project_dir_forbidden"
+        assert "project_dir" not in _by_id(state, PERSON)
+        assert _by_id(state, "fldr00000008")["project_dir"] == "/t"
+        # Refused before the path is looked at, like the agent-principal fence.
+        validator.assert_not_called()
+        state.mutate_folders.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_audited_against_the_channel_key(self, tmp_path) -> None:
+        state = _state(_ChatSlot("chat-1-100"))
+        with patch("kiro_crew.dashboard.chat_folders.sel") as sel_fn:
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.post(
+                    "/api/chat/folders",
+                    json={"name": "Runs", "project_dir": str(tmp_path)},
+                    headers={"X-Session-Key": self.CHANNEL},
+                )
+        assert resp.status == 403
+        kwargs = sel_fn.return_value.log_api_access.call_args.kwargs
+        assert kwargs["caller"] == self.CHANNEL
+        assert kwargs["operation"] == "chat.folder_create"
+        assert kwargs["outcome"] == "denied"
+        assert kwargs["source"] == "channel"
+        assert "project directory" in kwargs["error"]
+
+    @pytest.mark.asyncio
+    async def test_a_channel_agents_unbound_folder_writes_are_not_this_rule(self, tmp_path) -> None:
+        """Scope pin: the fence is on the BINDING. An unbound create and a
+        rename by the same channel key land exactly as they did."""
+        state = _state(_ChatSlot("chat-1-100"))
+        async with TestClient(TestServer(_make_app(state))) as client:
+            created = await client.post(
+                "/api/chat/folders",
+                json={"name": "Runs"},
+                headers={"X-Session-Key": self.CHANNEL},
+            )
+            renamed = await client.patch(
+                f"/api/chat/folders/{PERSON}",
+                json={"name": "Work items"},
+                headers={"X-Session-Key": self.CHANNEL},
+            )
+        assert (created.status, renamed.status) == (201, 200)
+        assert _by_id(state, PERSON)["name"] == "Work items"
+
+    @pytest.mark.asyncio
+    async def test_the_person_still_binds_at_create_and_update(self, tmp_path) -> None:
+        state = _state(_ChatSlot("chat-1-100"))
+        async with TestClient(TestServer(_make_app(state))) as client:
+            created = await client.post(
+                "/api/chat/folders",
+                json={"name": "Runs", "project_dir": str(tmp_path)},
+                headers={"X-Session-Key": "dashboard:chat-1-100"},
+            )
+            updated = await client.patch(
+                f"/api/chat/folders/{PERSON}",
+                json={"project_dir": str(tmp_path)},
+                headers={"X-Session-Key": "dashboard:chat-1-100"},
+            )
+        assert (created.status, updated.status) == (201, 200)
+        assert _by_id(state, PERSON)["project_dir"] == str(tmp_path.resolve())
+
+
+class TestAMoveCannotChangeWhatASubtreeInherits:
+    """The composition the create-only rule leaves open: an agent principal
+    binds a NEW folder at create (allowed -- nothing is filed in it yet), then
+    reparents an EXISTING folder it owns under it. Every session filed in the
+    moved subtree -- including one of the person's the folder store cannot see
+    -- resolves the destination's binding on its next agent switch, so the move
+    rebinds them exactly as the refused PATCH would have. The same holds in the
+    other direction (moving out from under a binding clears it).
+
+    Rule: an agent principal's reparent may not change what the moved subtree
+    inherits. A folder with a binding of its own moves freely (its subtree
+    resolves to it first); an unbound one may move only between places whose
+    inherited binding is the same. The person is never confined.
+    """
+
+    BOUND = "fldr00000009"
+    BOUND_CHILD = "fldr00000010"
+
+    @staticmethod
+    def _tree(bound_dir: str, radar_parent: str = "") -> list[dict[str, Any]]:
+        folders = _folders()
+        next(f for f in folders if f["id"] == RADAR)["parent_id"] = radar_parent
+        folders.append(
+            {
+                "id": TestAMoveCannotChangeWhatASubtreeInherits.BOUND,
+                "name": "Bound at create",
+                "parent_id": "",
+                "owner_app": "issue-radar",
+                "project_dir": bound_dir,
+            }
+        )
+        folders.append(
+            {
+                "id": TestAMoveCannotChangeWhatASubtreeInherits.BOUND_CHILD,
+                "name": "Under bound",
+                "parent_id": TestAMoveCannotChangeWhatASubtreeInherits.BOUND,
+                "owner_app": "issue-radar",
+            }
+        )
+        return folders
+
+    @pytest.mark.asyncio
+    async def test_an_app_cannot_move_its_folder_under_one_it_bound_at_create(
+        self, tmp_path
+    ) -> None:
+        """The exact composition: create C with project_dir, then reparent the
+        app's existing folder -- holding one of the person's chats -- under C.
+        Before: the move lands and the person's chat resolves C's directory.
+        After: refused with the binding-fence code, nothing inherited."""
+        theirs = _ChatSlot("chat-2-200")
+        theirs.folder_id = RADAR
+        state = _state(
+            _app_slot("chat-1-100", "issue-radar"), theirs, folders=self._tree(str(tmp_path))
+        )
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{RADAR}",
+                json={"parent_id": self.BOUND},
+                headers={"X-Session-Key": "dashboard:chat-1-100"},
+            )
+            body = await resp.json()
+        assert resp.status == 403
+        assert body["code"] == "folder_project_dir_forbidden"
+        assert _by_id(state, RADAR)["parent_id"] == ""
+        # What the person's chat resolves on its next agent switch: still nothing.
+        assert _resolve_folder_project_dir(state._folders, RADAR) == ("", None)
+
+    @pytest.mark.asyncio
+    async def test_moving_out_from_under_a_binding_is_refused_the_same_way(self, tmp_path) -> None:
+        """The clear direction: the subtree would stop inheriting."""
+        state = _state(
+            _app_slot("chat-1-100", "issue-radar"),
+            folders=self._tree(str(tmp_path), radar_parent=self.BOUND),
+        )
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{RADAR}",
+                json={"parent_id": ""},
+                headers={"X-Session-Key": "dashboard:chat-1-100"},
+            )
+            body = await resp.json()
+        assert resp.status == 403
+        assert body["code"] == "folder_project_dir_forbidden"
+        assert _by_id(state, RADAR)["parent_id"] == self.BOUND
+
+    @pytest.mark.asyncio
+    async def test_a_move_that_keeps_the_inherited_binding_still_lands(self, tmp_path) -> None:
+        """Between two places under the same bound ancestor nothing changes for
+        the subtree, so the app's own tree stays organisable."""
+        state = _state(
+            _app_slot("chat-1-100", "issue-radar"),
+            folders=self._tree(str(tmp_path), radar_parent=self.BOUND),
+        )
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{RADAR}",
+                json={"parent_id": self.BOUND_CHILD},
+                headers={"X-Session-Key": "dashboard:chat-1-100"},
+            )
+        assert resp.status == 200
+        assert _by_id(state, RADAR)["parent_id"] == self.BOUND_CHILD
+
+    @pytest.mark.asyncio
+    async def test_a_folder_with_its_own_binding_moves_freely(self, tmp_path) -> None:
+        """Nearest binding wins in the resolver, so a bound folder's subtree
+        resolves to it wherever it sits -- the move changes nothing inherited."""
+        folders = self._tree(str(tmp_path))
+        next(f for f in folders if f["id"] == RADAR)["project_dir"] = str(tmp_path / "own")
+        state = _state(_app_slot("chat-1-100", "issue-radar"), folders=folders)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{RADAR}",
+                json={"parent_id": self.BOUND},
+                headers={"X-Session-Key": "dashboard:chat-1-100"},
+            )
+        assert resp.status == 200
+        assert _by_id(state, RADAR)["parent_id"] == self.BOUND
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_audited(self, tmp_path) -> None:
+        state = _state(_app_slot("chat-1-100", "issue-radar"), folders=self._tree(str(tmp_path)))
+        with patch("kiro_crew.dashboard.chat_folders.sel") as sel_fn:
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.patch(
+                    f"/api/chat/folders/{RADAR}",
+                    json={"parent_id": self.BOUND},
+                    headers={"X-Session-Key": "dashboard:chat-1-100"},
+                )
+        assert resp.status == 403
+        kwargs = sel_fn.return_value.log_api_access.call_args.kwargs
+        assert kwargs["caller"] == "issue-radar"
+        assert kwargs["operation"] == "chat.folder_update"
+        assert kwargs["outcome"] == "denied"
+        assert kwargs["resources"] == RADAR
+        assert "inherit" in kwargs["error"]
+
+    @pytest.mark.asyncio
+    async def test_the_person_moves_across_bindings_freely(self, tmp_path) -> None:
+        state = _state(_ChatSlot("chat-1-100"), folders=self._tree(str(tmp_path)))
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{RADAR}",
+                json={"parent_id": self.BOUND},
+                headers={"X-Session-Key": "dashboard:chat-1-100"},
+            )
+        assert resp.status == 200
+        assert _by_id(state, RADAR)["parent_id"] == self.BOUND
+
+
+class TestAChannelAgentsMoveIsFencedOnTheBindingToo:
+    """The third path a channel agent reaches as the person. Its key names no
+    slot and no app, so ``folder_principal`` is ``""`` for it and the ownership
+    branches of the PATCH do not confine it -- a channel agent may reparent the
+    PERSON's folders, as it always could. The cross-binding move rule must not
+    key on that same principal, or the one caller the create and set-or-clear
+    fences refuse walks through the reparent: moving the person's unbound folder
+    under a bound one rebinds every chat filed in it on its next agent switch,
+    exactly as the refused PATCH would. One binding principal, computed once per
+    request, keys all three fences; the ownership branches stay on the folder
+    principal, so a channel agent's same-binding moves land as before.
+    """
+
+    CHANNEL = "channel:chan-000001:helper"
+    BOUND = "fldr00000011"
+    BOUND_CHILD = "fldr00000012"
+
+    @staticmethod
+    def _tree(bound_dir: str, person_parent: str = "") -> list[dict[str, Any]]:
+        folders = _folders()
+        next(f for f in folders if f["id"] == PERSON)["parent_id"] = person_parent
+        # The PERSON's bound folder: no owner key, so a channel agent reaches it
+        # exactly as it reaches the rest of the person's tree.
+        folders.append(
+            {
+                "id": TestAChannelAgentsMoveIsFencedOnTheBindingToo.BOUND,
+                "name": "Bound",
+                "parent_id": "",
+                "project_dir": bound_dir,
+            }
+        )
+        folders.append(
+            {
+                "id": TestAChannelAgentsMoveIsFencedOnTheBindingToo.BOUND_CHILD,
+                "name": "Under bound",
+                "parent_id": TestAChannelAgentsMoveIsFencedOnTheBindingToo.BOUND,
+            }
+        )
+        return folders
+
+    @pytest.mark.asyncio
+    async def test_a_channel_agent_cannot_move_the_persons_folder_under_a_binding(
+        self, tmp_path
+    ) -> None:
+        """Before: the move lands and the person's chat filed in the folder
+        resolves the bound folder's directory on its next agent switch. After:
+        refused with the binding-fence code, nothing inherited."""
+        theirs = _ChatSlot("chat-2-200")
+        theirs.folder_id = PERSON
+        state = _state(_ChatSlot("chat-1-100"), theirs, folders=self._tree(str(tmp_path)))
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{PERSON}",
+                json={"parent_id": self.BOUND},
+                headers={"X-Session-Key": self.CHANNEL},
+            )
+            body = await resp.json()
+        assert resp.status == 403
+        assert body["code"] == "folder_project_dir_forbidden"
+        assert _by_id(state, PERSON)["parent_id"] == ""
+        assert _resolve_folder_project_dir(state._folders, PERSON) == ("", None)
+
+    @pytest.mark.asyncio
+    async def test_moving_out_from_under_a_binding_is_refused_the_same_way(self, tmp_path) -> None:
+        """The clear direction: the person's chats inside would stop inheriting."""
+        state = _state(
+            _ChatSlot("chat-1-100"), folders=self._tree(str(tmp_path), person_parent=self.BOUND)
+        )
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{PERSON}",
+                json={"parent_id": ""},
+                headers={"X-Session-Key": self.CHANNEL},
+            )
+            body = await resp.json()
+        assert resp.status == 403
+        assert body["code"] == "folder_project_dir_forbidden"
+        assert _by_id(state, PERSON)["parent_id"] == self.BOUND
+
+    @pytest.mark.asyncio
+    async def test_a_move_that_keeps_the_inherited_binding_still_lands(self, tmp_path) -> None:
+        """Scope pin: the fence is on the BINDING, not on the channel agent's
+        other folder writes -- a move between two places under the same bound
+        ancestor changes nothing for the subtree and lands as it always did."""
+        state = _state(
+            _ChatSlot("chat-1-100"), folders=self._tree(str(tmp_path), person_parent=self.BOUND)
+        )
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{PERSON}",
+                json={"parent_id": self.BOUND_CHILD},
+                headers={"X-Session-Key": self.CHANNEL},
+            )
+        assert resp.status == 200
+        assert _by_id(state, PERSON)["parent_id"] == self.BOUND_CHILD
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_audited_against_the_channel_key(self, tmp_path) -> None:
+        state = _state(_ChatSlot("chat-1-100"), folders=self._tree(str(tmp_path)))
+        with patch("kiro_crew.dashboard.chat_folders.sel") as sel_fn:
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.patch(
+                    f"/api/chat/folders/{PERSON}",
+                    json={"parent_id": self.BOUND},
+                    headers={"X-Session-Key": self.CHANNEL},
+                )
+        assert resp.status == 403
+        kwargs = sel_fn.return_value.log_api_access.call_args.kwargs
+        assert kwargs["caller"] == self.CHANNEL
+        assert kwargs["operation"] == "chat.folder_update"
+        assert kwargs["outcome"] == "denied"
+        assert kwargs["source"] == "channel"
+        assert kwargs["resources"] == PERSON
+        assert "inherit" in kwargs["error"]
+
+
+class TestASessionDrivenFromAMessagingChannelIsFencedTheSameWay:
+    """A turn driven from a messaging-transport thread -- a ``slack:`` thread, a
+    ``discord:`` DM, any namespace ``messaging.link.is_channel_session_key``
+    classifies -- carries that key as its verified ``X-Session-Key``. Like a
+    Channels agent's key it names no slot and no app, so ``folder_principal``
+    reads it as the PERSON; unlike it, it does not start with ``channel:``, so a
+    binding principal that recognised only that prefix let the same words from
+    a thread other people are in bind a folder, rebind one, move one across a
+    binding and (in the steering module) declare host-file reads with the
+    person's authority. The principal now recognises the transport namespaces
+    through the repo's one predicate -- the roster is imported here, not
+    re-listed -- so every fence keyed on it confines these keys too. The same
+    key's writes that are not a binding (an unbound create, a rename, a move
+    between places with the same binding) land as before.
+    """
+
+    SLACK = "slack:1785370133.085469"
+    BOUND = "fldr00000021"
+    BOUND_CHILD = "fldr00000022"
+
+    @staticmethod
+    def _tree(bound_dir: str, person_parent: str = "") -> list[dict[str, Any]]:
+        folders = _folders()
+        next(f for f in folders if f["id"] == PERSON)["parent_id"] = person_parent
+        folders.append(
+            {
+                "id": TestASessionDrivenFromAMessagingChannelIsFencedTheSameWay.BOUND,
+                "name": "Bound",
+                "parent_id": "",
+                "project_dir": bound_dir,
+            }
+        )
+        folders.append(
+            {
+                "id": TestASessionDrivenFromAMessagingChannelIsFencedTheSameWay.BOUND_CHILD,
+                "name": "Under bound",
+                "parent_id": TestASessionDrivenFromAMessagingChannelIsFencedTheSameWay.BOUND,
+            }
+        )
+        return folders
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("namespace", CHANNEL_SESSION_NAMESPACES)
+    async def test_no_transport_namespace_can_create_a_bound_folder(
+        self, tmp_path, namespace: str
+    ) -> None:
+        """Every namespace the roster names, not one spelling: the fence reuses the
+        predicate, so a transport added to the roster is fenced without a change here."""
+        state = _state(_ChatSlot("chat-1-100"))
+        before = len(state._folders)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/folders",
+                json={"name": "Runs", "project_dir": str(tmp_path)},
+                headers={"X-Session-Key": f"{namespace}:conversation-1"},
+            )
+            body = await resp.json()
+        assert resp.status == 403, body
+        assert body["code"] == "folder_project_dir_forbidden"
+        assert len(state._folders) == before
+
+    @pytest.mark.asyncio
+    async def test_it_cannot_set_or_clear_an_existing_folders_binding(self, tmp_path) -> None:
+        state = _state(_ChatSlot("chat-1-100"), folders=self._tree("/t"))
+        with patch(
+            "kiro_crew.dashboard.chat_folders._validate_project_dir",
+            return_value=(str(tmp_path), None),
+        ) as validator:
+            async with TestClient(TestServer(_make_app(state))) as client:
+                setting = await client.patch(
+                    f"/api/chat/folders/{PERSON}",
+                    json={"project_dir": str(tmp_path)},
+                    headers={"X-Session-Key": self.SLACK},
+                )
+                set_body = await setting.json()
+                clearing = await client.patch(
+                    f"/api/chat/folders/{self.BOUND}",
+                    json={"project_dir": ""},
+                    headers={"X-Session-Key": self.SLACK},
+                )
+        assert (setting.status, clearing.status) == (403, 403), set_body
+        assert set_body["code"] == "folder_project_dir_forbidden"
+        assert "project_dir" not in _by_id(state, PERSON)
+        assert _by_id(state, self.BOUND)["project_dir"] == "/t"
+        validator.assert_not_called()
+        state.mutate_folders.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_it_cannot_move_the_persons_folder_across_a_binding(self, tmp_path) -> None:
+        """Both directions: under a binding (the person's chat filed inside would
+        inherit it) and out from under one (it would stop inheriting)."""
+        theirs = _ChatSlot("chat-2-200")
+        theirs.folder_id = PERSON
+        state = _state(_ChatSlot("chat-1-100"), theirs, folders=self._tree(str(tmp_path)))
+        async with TestClient(TestServer(_make_app(state))) as client:
+            under = await client.patch(
+                f"/api/chat/folders/{PERSON}",
+                json={"parent_id": self.BOUND},
+                headers={"X-Session-Key": self.SLACK},
+            )
+            under_body = await under.json()
+        assert under.status == 403, under_body
+        assert under_body["code"] == "folder_project_dir_forbidden"
+        assert _by_id(state, PERSON)["parent_id"] == ""
+        assert _resolve_folder_project_dir(state._folders, PERSON) == ("", None)
+
+        state = _state(
+            _ChatSlot("chat-1-100"), folders=self._tree(str(tmp_path), person_parent=self.BOUND)
+        )
+        async with TestClient(TestServer(_make_app(state))) as client:
+            out = await client.patch(
+                f"/api/chat/folders/{PERSON}",
+                json={"parent_id": ""},
+                headers={"X-Session-Key": self.SLACK},
+            )
+        assert out.status == 403
+        assert _by_id(state, PERSON)["parent_id"] == self.BOUND
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_audited_against_the_transport_key(self, tmp_path) -> None:
+        state = _state(_ChatSlot("chat-1-100"))
+        with patch("kiro_crew.dashboard.chat_folders.sel") as sel_fn:
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.post(
+                    "/api/chat/folders",
+                    json={"name": "Runs", "project_dir": str(tmp_path)},
+                    headers={"X-Session-Key": self.SLACK},
+                )
+        assert resp.status == 403
+        kwargs = sel_fn.return_value.log_api_access.call_args.kwargs
+        assert kwargs["caller"] == self.SLACK
+        assert kwargs["operation"] == "chat.folder_create"
+        assert kwargs["outcome"] == "denied"
+        assert kwargs["source"] == "channel"
+
+    @pytest.mark.asyncio
+    async def test_its_unbound_writes_and_same_binding_moves_still_land(self, tmp_path) -> None:
+        """Scope pin: the fence is on the BINDING. An unbound create, a rename and
+        a move between two places under the same bound ancestor land exactly as
+        they did for a Slack-driven turn."""
+        state = _state(
+            _ChatSlot("chat-1-100"), folders=self._tree(str(tmp_path), person_parent=self.BOUND)
+        )
+        async with TestClient(TestServer(_make_app(state))) as client:
+            created = await client.post(
+                "/api/chat/folders", json={"name": "Runs"}, headers={"X-Session-Key": self.SLACK}
+            )
+            renamed = await client.patch(
+                f"/api/chat/folders/{RADAR}",
+                json={"name": "Tidied"},
+                headers={"X-Session-Key": self.SLACK},
+            )
+            moved = await client.patch(
+                f"/api/chat/folders/{PERSON}",
+                json={"parent_id": self.BOUND_CHILD},
+                headers={"X-Session-Key": self.SLACK},
+            )
+        assert (created.status, renamed.status, moved.status) == (201, 200, 200)
+        assert _by_id(state, PERSON)["parent_id"] == self.BOUND_CHILD
+
+
+class TestAMoveCannotChangeWhatASubtreeInheritsForSteeringEither:
+    """The second thing a folder's ancestry decides for every chat filed beneath
+    it: the steering directories it inherits, ACCUMULATIVELY up ``parent_id``
+    (``_resolve_folder_steering_dirs``), read into each chat's model context at
+    session start. The binding branch of the move rule compared only the
+    inherited ``project_dir``, so a channel agent -- refused a ``steering_dirs``
+    declaration of its own -- could reparent the person's folder under one that
+    declares steering whenever both places inherit the same binding, and the
+    person's chats filed inside picked those documents up at their next start:
+    the declaration fence, reached through the tree. So the same pre-commit
+    branch compares what the moved subtree would inherit for steering too --
+    the stored declarations of every ancestor, root-first, with each declaring
+    folder's owner, exactly the data the resolver consumes -- and refuses a
+    move that changes it, in either direction, with the steering fence's own
+    code. A move between two places that inherit the same steering lands; the
+    person is not confined.
+    """
+
+    CHANNEL = "channel:chan-000001:helper"
+    STEERED = "fldr00000031"
+    STEERED_CHILD = "fldr00000032"
+    RADAR_STEERED = "fldr00000033"
+    RADAR_LEAF = "fldr00000034"
+
+    @staticmethod
+    def _tree(person_parent: str = "") -> list[dict[str, Any]]:
+        folders = _folders()
+        next(f for f in folders if f["id"] == PERSON)["parent_id"] = person_parent
+        cls = TestAMoveCannotChangeWhatASubtreeInheritsForSteeringEither
+        folders.extend(
+            [
+                # The PERSON's folder declaring steering: stored strings, never
+                # validated here -- the branch runs under the store lock.
+                {
+                    "id": cls.STEERED,
+                    "name": "Standards",
+                    "parent_id": "",
+                    "steering_dirs": ["/srv/standards"],
+                },
+                {"id": cls.STEERED_CHILD, "name": "Under standards", "parent_id": cls.STEERED},
+                # An app's folder on which the PERSON declared steering (allowed:
+                # the delivery gate routes it to the app's own chats), holding an
+                # unbound folder of the app's.
+                {
+                    "id": cls.RADAR_STEERED,
+                    "name": "Radar standards",
+                    "parent_id": "",
+                    "owner_app": "issue-radar",
+                    "steering_dirs": ["/srv/radar-standards"],
+                },
+                {
+                    "id": cls.RADAR_LEAF,
+                    "name": "Radar runs",
+                    "parent_id": cls.RADAR_STEERED,
+                    "owner_app": "issue-radar",
+                },
+            ]
+        )
+        return folders
+
+    @pytest.mark.asyncio
+    async def test_a_channel_agent_cannot_move_the_persons_folder_under_declared_steering(
+        self,
+    ) -> None:
+        """Both places inherit the same (empty) binding, so the binding branch is
+        silent. Before: the move lands and the person's chat filed inside
+        inherits ``/srv/standards`` at its next start. After: refused with the
+        steering fence's code, nothing inherited."""
+        theirs = _ChatSlot("chat-2-200")
+        theirs.folder_id = PERSON
+        state = _state(_ChatSlot("chat-1-100"), theirs, folders=self._tree())
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{PERSON}",
+                json={"parent_id": self.STEERED},
+                headers={"X-Session-Key": self.CHANNEL},
+            )
+            body = await resp.json()
+        assert resp.status == 403, body
+        assert body["code"] == "steering_dirs_forbidden"
+        assert _by_id(state, PERSON)["parent_id"] == ""
+        assert _inherited_steering_dirs(state._folders, PERSON) == ()
+
+    @pytest.mark.asyncio
+    async def test_moving_out_from_under_declared_steering_is_refused_too(self) -> None:
+        """The clear direction: the person's chats inside would stop receiving
+        the standards the person put above them."""
+        state = _state(_ChatSlot("chat-1-100"), folders=self._tree(person_parent=self.STEERED))
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{PERSON}",
+                json={"parent_id": ""},
+                headers={"X-Session-Key": self.CHANNEL},
+            )
+            body = await resp.json()
+        assert resp.status == 403, body
+        assert body["code"] == "steering_dirs_forbidden"
+        assert _by_id(state, PERSON)["parent_id"] == self.STEERED
+
+    @pytest.mark.asyncio
+    async def test_an_app_is_held_to_the_same_rule_on_its_own_folders(self) -> None:
+        """Its own unbound folder, out from under its own folder on which the
+        person declared steering: the app's chats filed in it would stop
+        receiving what the person declared for them. Refused, as every agent
+        principal is."""
+        state = _state(_app_slot("chat-1-100", "issue-radar"), folders=self._tree())
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{self.RADAR_LEAF}",
+                json={"parent_id": ""},
+                headers={"X-Session-Key": "dashboard:chat-1-100"},
+            )
+            body = await resp.json()
+        assert resp.status == 403, body
+        assert body["code"] == "steering_dirs_forbidden"
+        assert _by_id(state, self.RADAR_LEAF)["parent_id"] == self.RADAR_STEERED
+
+    @pytest.mark.asyncio
+    async def test_a_move_that_keeps_the_inherited_steering_still_lands(self) -> None:
+        """Scope pin: between two places under the same declaring ancestor the
+        accumulated set is identical, so the move lands as it always did."""
+        state = _state(_ChatSlot("chat-1-100"), folders=self._tree(person_parent=self.STEERED))
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{PERSON}",
+                json={"parent_id": self.STEERED_CHILD},
+                headers={"X-Session-Key": self.CHANNEL},
+            )
+        assert resp.status == 200, await resp.text()
+        assert _by_id(state, PERSON)["parent_id"] == self.STEERED_CHILD
+
+    @pytest.mark.asyncio
+    async def test_the_person_is_not_confined(self) -> None:
+        state = _state(_ChatSlot("chat-1-100"), folders=self._tree())
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{PERSON}",
+                json={"parent_id": self.STEERED},
+                headers={"X-Session-Key": "dashboard:chat-1-100"},
+            )
+        assert resp.status == 200, await resp.text()
+        assert _by_id(state, PERSON)["parent_id"] == self.STEERED
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_audited_against_the_channel_key(self) -> None:
+        state = _state(_ChatSlot("chat-1-100"), folders=self._tree())
+        with patch("kiro_crew.dashboard.chat_folders.sel") as sel_fn:
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.patch(
+                    f"/api/chat/folders/{PERSON}",
+                    json={"parent_id": self.STEERED},
+                    headers={"X-Session-Key": self.CHANNEL},
+                )
+        assert resp.status == 403
+        kwargs = sel_fn.return_value.log_api_access.call_args.kwargs
+        assert kwargs["caller"] == self.CHANNEL
+        assert kwargs["operation"] == "chat.folder_update"
+        assert kwargs["outcome"] == "denied"
+        assert kwargs["source"] == "channel"
+        assert kwargs["resources"] == PERSON
+        assert "steering" in kwargs["error"]
 
 
 class TestAnAppCannotDeleteFolders:

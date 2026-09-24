@@ -1191,7 +1191,7 @@ Managed servers, registered by `agent._MANAGED_MCP_SERVERS` and installed into
 | `kirocrew-cron` | `kirocrew mcp-cron` (`mcp_cron.py`) | `cron_add`, `cron_list`, `cron_update`, `cron_remove`, `cron_remove_all`, `cron_pause`, `cron_resume`, `cron_trigger`, `cron_secret_request` |
 | `kirocrew-core` | `kirocrew mcp-core` (`mcp_core.py` + `mcp_tools/`) | spawn/subagent, learn, task, messaging, artifact, workflow, knowledge and session-directive tools (see below) |
 | `kirocrew-computer` | `kirocrew mcp-computer` (`mcp_computer.py`) | `computer_list_apps`, `computer_launch_app`, `computer_get_state`, `computer_click`, `computer_drag`, `computer_type_text`, `computer_press_key`, `computer_set_value`, `computer_scroll`, `computer_perform_action`, `computer_end_turn` |
-| `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_move_session`, `chat_folder_file_self`, `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`, `session_create`, `session_fork`, `session_send`, `session_read_message`, `session_stop`, `session_close` |
+| `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_update`, `chat_folder_move`, `chat_folder_move_session`, `chat_folder_file_self`, `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`, `session_create`, `session_fork`, `session_stop`, `session_close`, `session_send`, `session_adopt`, `session_release`, `session_read_message` |
 | `kirocrew-work` | `kirocrew mcp-work` (`mcp_work.py`) | `work_brief`, `work_report`, `work_ledger_read`, `work_ledger_record` |
 | `kirocrew-crew-log` | `kirocrew mcp-crew-log` (`mcp_crew_log.py`) | `crew_log_list`, `crew_log_read`, `crew_log_projection` |
 | `kirocrew-debug` | `kirocrew mcp-debug` (`mcp_debug.py`) | `debug_gateway`, `debug_refusals`, `debug_threads`, `debug_processes`, `debug_snapshots` |
@@ -1606,6 +1606,102 @@ the store lock and sees the authoritative tree, so a second copy of the rule in
 the tool layer could only drift or race. What the tool layer still decides is the
 one question the endpoint cannot: whether the caller can be placed at all, since
 an unverifiable or delegated caller has no scope to bound a write to.
+
+**A folder's project directory is agent-settable, through the same two routes
+and the same validator the sidebar uses.** A chat the person opens inside a
+folder (`POST /api/chat/slots`) inherits the nearest ancestor's `project_dir`
+at creation — before its context is built — and that is the only zero-cost path
+to a project-scoped session:
+`project_scope_satisfied()` fails closed without one (no repo-scoped lessons,
+no project `.kiro/steering`), context is injected once at session start, and
+`set_project` afterwards tears the session down at the turn boundary.
+(`session_create` files its child but resolves the child's project from the
+caller's workspace, not the folder; #11680 adds that inheritance.) So an
+agent that could create the folder but not bind it (#10432) had to stop and
+ask the person to paste a path into Folder settings. `chat_folder_create` now
+takes an optional `project_dir`, carried on the same `POST /api/chat/folders`
+body the sidebar sends, and `chat_folder_update` sets or clears it on an
+existing folder (id or human path, resolved as `chat_folder_move` resolves one)
+with a one-field `PATCH /api/chat/folders/{id}`. Neither re-implements the
+path checks: `chat_folders._admit_project_dir` (the UNC refusal, then
+`_validate_project_dir`: absolute or `~`-prefixed, existing directory, never a
+sensitive location) and the
+workspace-overlap guard run inside the endpoint, and its refusal is the tool's
+error text. The tool layer deliberately runs no filesystem check of its own —
+the kiro-cli subprocess tree these servers live in is sandboxed (`sandbox.py`
+bind-mounts credential paths away), so a check there would not see what the
+gateway sees — and its schema bounds only the length (PATH_MAX, the same bound
+`set_project` uses). Its ONE pre-check is lexical and is the endpoint's own
+helper (`project_dir_unc_refusal`, over `hooks.is_unc_shape` /
+`unc_probe_allowed`): a UNC-shaped `project_dir` names a host that a Windows
+gateway's `realpath` would contact over SMB, so the endpoint refuses the shape
+before any filesystem call and the tool refuses it before posting — on every
+host, since path text is untrusted everywhere — and the agent reads the same
+words without a round trip. The rule is admission-only and shared: the folder
+routes, the scaffold's scan root, the `set_project` directive and the slot
+project endpoint all run the same helper before their own `realpath`, while the
+stored-value read path (`_resolve_folder_project_dir`, on slot create and agent
+switch) does not — a folder bound to a share before the rule existed keeps
+resolving as it did, rather than failing every chat opened in it. The one cost
+of that choice is the `mkdir -p`
+posture every leaf refusal already has: parent segments a `parent` path asked
+for are created before the leaf's POST is refused (the UNC refusal alone lands
+before the parent walk), and are named in the result. Ownership is the
+endpoint's: an app or crew member binds a folder only when it CREATES it. The
+PATCH route refuses an agent principal's `project_dir` change on an existing
+folder outright (403 `folder_project_dir_forbidden`, before the path is
+validated) — even on its own folder holding only its own folders — because the
+sessions a binding reaches on their next agent switch (`api_chat_slot_agent`
+re-resolves the folder chain) live in the slot table and the session archive,
+neither sharing a lock with the folder store, the archive's index carries no
+owner, and a session revives with its `folder_id` intact; "every session under
+this folder is the caller's own" cannot be established atomically with the
+write, the same seam that refuses an app's folder delete. The person keeps the
+update. The same rule has a reparent half: an UNBOUND folder's subtree resolves
+its nearest bound ancestor, so an agent principal moving a folder it owns under
+one it bound at create (allowed — a new folder holds no sessions), or out from
+under a binding, would rebind the person's chat filed inside it just as the
+refused PATCH would. The PATCH's `_apply` therefore refuses a `parent_id` change
+by an agent principal when the stored binding the moved folder inherits at its
+current place differs from the one at its destination (same 403, decided under
+the store lock, where a concurrent move or a person's PATCH cannot change either
+side between validation and write); a folder with a binding of its own is exempt
+(nearest wins, so its subtree resolves to it wherever it sits), and so is a move
+between two places that inherit the same binding. And a channel caller — a
+Channels agent (`channel:<channel_id>:<agent_id>`) or a session driven from a
+messaging transport (`slack:`, `discord:`, every namespace
+`messaging.link.is_channel_session_key` classifies), either key naming no slot
+and no app, so `folder_principal` reads it as the person — is refused a binding
+on ALL THREE paths
+— `project_dir` on the create, set or clear on the PATCH, and a reparent across a
+binding — with the same 403. The three fences key on one binding principal,
+derived once per request (`_binding_principal`: the folder principal when set,
+else the caller's own key for a channel caller, else the person), so a path
+cannot fence apps and members and let the channel caller through, as the reparent
+branch once did by keying on the folder principal; the ownership branches stay on
+that folder principal, so a channel caller still reparents the person's folders
+between places with the same binding, and its unbound folder writes are not this
+fence's concern. The same reparent branch compares the STEERING the moved
+subtree would inherit (`_inherited_steering_dirs`: every ancestor's stored
+declaration with its owner, root-first, validation-free under the lock) and
+refuses an agent principal's move that changes it with the steering gate's 403 —
+a move under a folder declaring steering hands those documents to every chat
+filed in the subtree at its next start, and the binding branch is silent
+whenever both places inherit the same binding. The `steering_dirs` principal
+gate at both of its write sites
+keys on the same binding principal (a steering declaration is a gateway host-file
+read — the same gap class), so a channel caller is refused it as an app or member
+is, with that gate's own 403. The route runs
+`_admit_project_dir` off-loop as the create route does. No new capability is
+granted — `set_project` already takes a
+caller-named absolute path from an agent under the same refusals, and
+`_folder_project_overlap_denied` names it as sharing "the same shared scan and
+message as the project endpoint and set_project". The conductor grant keeps
+`chat_folder_create` (a new folder's binding mutates nothing the person
+arranged) and withholds `chat_folder_update` (an existing folder's binding is
+state the person arranged, and no conductor step needs it). Precedents: #2761
+made folders agent-creatable, #6118 made sessions agent-filable at creation;
+this is the last binding in that progression.
 
 **Filing your own session is a separate verb, `chat_folder_file_self`, because
 the grant is name-scoped.** `chat_folder_move_session` takes its target from an
