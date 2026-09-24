@@ -57,6 +57,7 @@ from kiro_crew.discord.commands import (
 from kiro_crew.discord.renderer import (
     DiscordApprovalDecider,
     DiscordRenderer,
+    _delivered_form,
     _extract_options,
     _strip_steering,
     build_option_components,
@@ -77,7 +78,11 @@ from kiro_crew.discord.transport_dispatch import (
 )
 from kiro_crew.messaging import driver as messaging_driver
 from kiro_crew.messaging.attachments import cleanup
-from kiro_crew.messaging.display_safety import canonicalize_display
+from kiro_crew.messaging.display_safety import (
+    canonicalize_display,
+    redact_across_delivery,
+    severs_a_credential,
+)
 from kiro_crew.messaging.link import (
     UNBIND_REASON_UNSPECIFIED,
     ChannelLink,
@@ -162,6 +167,25 @@ class MultipartFake:
         return await self.edit_message(  # type: ignore[attr-defined]
             channel_id, message_id, text, components=components
         )
+
+    async def edit_message_visibility(
+        self,
+        channel_id: str,
+        message_id: str,
+        text: str,
+        files: Any = (),
+        *,
+        components: Any = None,
+    ) -> str:
+        """Delegates, so a test that patches the bool verbs still drives this one.
+
+        A test that needs the third answer -- the message is GONE -- patches this
+        method directly and returns "gone".
+        """
+        landed = await self.edit_message_with_files(
+            channel_id, message_id, text, files, components=components
+        )
+        return "ok" if landed else "failed"
 
 
 class FakeClient(MultipartFake):
@@ -1221,6 +1245,267 @@ class TestRotationSeamCredentialSafety:
         await r._seal_current(extract_uploads=False)
         return [text for text, _ in cli.sent]
 
+    @pytest.mark.asyncio
+    async def test_a_live_frame_is_graded_against_the_message_above_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Streaming frames are on screen too, for the whole turn.
+
+        The seal is not the first thing a reader sees: every throttled frame is sent
+        or edited live, under a message that is already closed. A frame grows at its
+        end, so the growth can complete a key whose head sits at the end of that
+        closed message -- and the frame on its own reads clean the entire time. The
+        exposure lasts until the seal, which is the whole streaming window.
+        """
+        r, cli = self._renderer(monkeypatch, self._LIMIT)
+        r._delivered_window = ["the note above ends AKIAIOSF"]
+        r._buf = ["ODNN7EXAMPLE and the answer goes on"]
+
+        await r._stream_live(force=True)
+
+        assert cli.sent, "fixture did not put a frame on screen"
+        self._assert_no_key_on_screen([*r._delivered_window, *[text for text, _ in cli.sent]])
+
+    @pytest.mark.asyncio
+    async def test_a_reasoning_post_is_graded_and_becomes_the_predecessor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reasoning preview is a message, and it lands flush against the answer.
+
+        It is posted on the first chunk, so nothing sits between it and the opening
+        answer message. Both directions are asserted: it is graded against whatever is
+        already closed above it, and once it lands the answer below is graded against
+        it rather than against the message further up.
+        """
+        r, cli = self._renderer(monkeypatch, self._LIMIT)
+        r._delivered_window = ["the note above ends AKIAIOSF"]
+        r._thinking = "ODNN7EXAMPLE is the reasoning tail"
+
+        await r._flush_thinking()
+
+        assert cli.sent, "fixture did not post a reasoning message"
+        self._assert_no_key_on_screen([*r._delivered_window, *[t for t, _ in cli.sent]])
+        assert r._delivered_window, "a delivered reasoning post left no predecessor"
+
+    @pytest.mark.asyncio
+    async def test_a_cut_after_trailing_space_is_graded_on_the_trimmed_form(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Discord shows the reader the trimmed text, so the grade must trim too.
+
+        This shape is MEASURED, not assumed. At this limit the splitter's own chunks
+        already sever, so the rotation does consult the offset search; the offset a
+        non-trimming transform returns leaves halves whose RAW forms are safe -- the
+        spaces sit between them -- while their DELIVERED forms sit flush and read as one
+        key. The assertion is therefore on the delivered forms: comparing the raw frames
+        is what makes this hazard invisible.
+        """
+        head, tail = "AKIAIOSF", "ODNN7EXAMPLE"
+        prefix = "word " * 20
+        src = prefix + head + "   " + tail + " trailing prose here"
+        r, cli = self._renderer(monkeypatch, len(prefix + head) + 3)
+        r._buf = [src]
+
+        await r._rotate_on_length()
+        await r._seal_current(extract_uploads=False)
+
+        frames = [text for text, _ in cli.sent]
+        assert len(frames) >= 2, f"fixture delivered {len(frames)} frame(s), so it grades no seam"
+        self._assert_no_key_on_screen([_delivered_form(f) for f in frames])
+
+    @pytest.mark.asyncio
+    async def test_a_failed_edit_leaves_the_frame_on_screen_and_it_is_graded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An edit returns False on ANY api failure, so the frame can still be visible.
+
+        The client cannot tell a deleted message from a 429, so the seal falls through
+        to a SEND while the frame is still on the reader's screen. That frame then sits
+        between the last closed message and the text going out, and the grade made
+        before the edit was attempted could not have included it.
+        """
+        r, cli = self._renderer(monkeypatch, self._LIMIT)
+        r._delivered_window = ["an older closed message"]
+        r._shown = "the live frame ends AKIAIOSF"
+        r._stream_mid = 4242
+
+        async def _edit_fails(*_args: object, **_kwargs: object) -> bool:
+            return False
+
+        monkeypatch.setattr(r._client, "edit_message_with_files", _edit_fails)
+
+        assert await r._land_sealed("ODNN7EXAMPLE and the answer goes on", [], None)
+
+        assert cli.sent, "fixture did not fall through to a send"
+        self._assert_no_key_on_screen([r._shown, *[text for text, _ in cli.sent]])
+
+    @pytest.mark.asyncio
+    async def test_a_sealed_segment_becomes_the_predecessor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The caller opens a new message only for a chunk that is NOT the last one.
+
+        So the final chunk's promotion cannot live in the caller: anything delivered
+        after the segment would then be graded against the message above it rather than
+        against the segment itself. Sealing is what makes a message final, so the seal
+        records it.
+        """
+        r, cli = self._renderer(monkeypatch, self._LIMIT)
+        text = "the sealed segment ends AKIAIOSF"
+
+        assert await r._land_sealed(text, [], None), "fixture did not land a seal"
+
+        assert cli.sent, "nothing reached the channel"
+        assert r._delivered_window, "a landed seal left no predecessor"
+        assert r._delivered_window[-1:] == [
+            text
+        ], "a sealed message is beyond editing the moment it lands"
+
+    @pytest.mark.asyncio
+    async def test_a_key_spanning_three_messages_is_caught_though_no_pair_shows_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Canonicalising is non-local, so completing a key can take three messages.
+
+        A head, a message holding only a link target, and the closing bracket. The
+        markdown link matches only once the bracket arrives, and until then the target is
+        literal text standing between the two halves of the key -- so every ADJACENT PAIR
+        reads clean, which the two assertions below MEASURE rather than assume. A window
+        holding one predecessor therefore cannot see this however carefully the boundary
+        is graded: the head is not in it.
+        """
+        above = "the note above ends AKIAIOSF"
+        middle = "[ODNN7EXAMPLE](https://example.com/one"
+        pending = ") and more prose"
+        assert not severs_a_credential(
+            [middle, pending], _default_redactor
+        ), "the nearest pair already severs, so one predecessor would have caught this"
+        assert not severs_a_credential(
+            [above, middle], _default_redactor
+        ), "the earlier pair already severs, so an earlier grade would have caught this"
+
+        r, cli = self._renderer(monkeypatch, self._LIMIT)
+        assert await r._land_sealed(above, [], None), "fixture did not land the head"
+        assert await r._land_sealed(middle, [], None), "fixture did not land the link target"
+        assert await r._land_sealed(pending, [], None), "fixture did not land the bracket"
+
+        frames = [text for text, _ in cli.sent]
+        assert len(frames) == 3, f"fixture delivered {len(frames)} message(s), so it spans no three"
+        self._assert_no_key_on_screen(frames)
+
+    @pytest.mark.asyncio
+    async def test_a_refused_live_edit_does_not_become_the_graded_neighbour(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A refused edit leaves the frame showing the text of the last one that landed.
+
+        The client returns False on ANY api failure, so an attempt recorded as shown
+        points the seal's fallback grade at text nobody can see, and leaves the text the
+        reader DOES see out of the window -- which is the neighbour the key completes
+        against.
+
+        The screen is asserted from the frame's own literal text, not from ``_shown``:
+        reading the field under test would make this pass by agreeing with the defect.
+        """
+        r, cli = self._renderer(monkeypatch, self._LIMIT)
+        frame = "the live frame ends AKIAIOSF"
+        r._buf = [frame]
+        await r._stream_live(force=True)
+        assert r._shown == frame, "fixture did not confirm a frame"
+
+        async def _edit_refused(*_args: object, **_kwargs: object) -> bool:
+            return False
+
+        monkeypatch.setattr(r._client, "edit_message", _edit_refused)
+        r._buf = ["an innocuous later draft"]
+        await r._stream_live(force=True)
+        assert r._shown == frame, "a refused edit was recorded as the text on screen"
+
+        monkeypatch.setattr(r._client, "edit_message_with_files", _edit_refused)
+        assert await r._land_sealed("ODNN7EXAMPLE and the answer goes on", [], None)
+
+        assert cli.sent, "fixture did not fall through to a send"
+        self._assert_no_key_on_screen([frame, *[text for text, _ in cli.sent]])
+        assert r._delivered_window[-2:-1] == [
+            frame
+        ], "the orphaned frame is still on screen, so it stays in the window"
+
+    @pytest.mark.asyncio
+    async def test_an_orphaned_frame_survives_a_failed_send(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two api failures in a row is ordinary operation, not an extreme combination.
+
+        The edit fails, so the frame is orphaned and the seal falls through to a send; the
+        send fails too. The frame is still on the reader's screen and nothing will ever
+        edit it again, so it has to be in the window for the NEXT delivery -- entering it
+        only where the send lands drops it outright, and no later path puts it back.
+        """
+        r, cli = self._renderer(monkeypatch, self._LIMIT)
+        frame = "the live frame ends AKIAIOSF"
+        r._buf = [frame]
+        await r._stream_live(force=True)
+        assert r._shown == frame, "fixture did not confirm a frame"
+
+        async def _edit_refused(*_args: object, **_kwargs: object) -> bool:
+            return False
+
+        async def _send_refused(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        # Scoped to the failing round only. A shared-fixture `undo()` would also be
+        # reverting patches this test does not own.
+        with pytest.MonkeyPatch.context() as failing:
+            failing.setattr(r._client, "edit_message_with_files", _edit_refused)
+            failing.setattr(r._client, "send_message_with_files", _send_refused)
+            assert not await r._land_sealed("a first attempt that lands nowhere", [], None)
+
+        assert await r._land_sealed("ODNN7EXAMPLE and the answer goes on", [], None)
+
+        delivered = [text for text, _ in cli.sent]
+        assert len(delivered) >= 2, f"fixture delivered {len(delivered)}, so it grades no seam"
+        self._assert_no_key_on_screen([frame, delivered[-1]])
+
+    @pytest.mark.asyncio
+    async def test_a_frame_reported_gone_does_not_separate_the_real_pair(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed edit is not one condition but two, and they need opposite handling.
+
+        A 429 leaves the bubble on screen; a 404 means someone removed it, which on
+        Telegram is a one-tap "delete for everyone" and on Discord an ordinary
+        moderator action. Keeping a removed frame in the window puts a message the
+        reader cannot see between two the reader sees as NEIGHBOURS, and
+        `severs_a_credential` reads the pair it separates as no pair at all -- so the
+        grade misses and the key ships. Measured below: the real pair severs on its own
+        and does not sever with the frame wedged between.
+        """
+        above = "the closed message above ends AKIAIOSF"
+        frame = "a live frame the reader deleted"
+        pending = "ODNN7EXAMPLE and the answer goes on"
+        assert severs_a_credential(
+            [above, pending], _default_redactor
+        ), "fixture's real pair does not sever, so nothing can be hidden"
+        assert not severs_a_credential(
+            [above, frame, pending], _default_redactor
+        ), "the wedged frame does not hide the pair, so this fixture proves nothing"
+
+        r, cli = self._renderer(monkeypatch, self._LIMIT)
+        assert await r._land_sealed(above, [], None), "fixture did not land the message above"
+        r._buf = [frame]
+        await r._stream_live(force=True)
+        assert r._shown == frame, "fixture did not confirm a frame"
+
+        async def _reports_gone(*_args: object, **_kwargs: object) -> str:
+            return "gone"
+
+        monkeypatch.setattr(r._client, "edit_message_visibility", _reports_gone)
+        assert await r._land_sealed(pending, [], None), "fixture did not fall through to a send"
+
+        delivered = [text for text, _ in cli.sent]
+        self._assert_no_key_on_screen([above, delivered[-1]])
+        assert frame not in r._delivered_window, "a frame reported gone stayed in the window"
+
     @staticmethod
     def _assert_no_key_on_screen(frames: list[str]) -> None:
         for reading in (
@@ -1365,6 +1650,83 @@ class TestRotationSeamCredentialSafety:
         await r._rotate_on_length()
         await r._seal_current(extract_uploads=False)
         self._assert_no_key_on_screen([text for text, _ in cli.sent])
+
+
+class TestCrossDeliveryRedaction:
+    """``redact_across_delivery`` -- the boundary with a message already on screen."""
+
+    def test_the_result_answers_to_the_detector_that_fired(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The remedy is verified by ``severs_a_credential``, not by a weaker scanner.
+
+        ``redact_for_display`` reads fewer forms than the detector -- it has no
+        per-piece canonical reading -- so its rewrite is a first attempt, not the
+        answer. Here it is stubbed to a no-op, which is the worst case that reading
+        gap can produce, and the function must still hand back something the detector
+        accepts rather than the completion it was given.
+        """
+        monkeypatch.setattr(
+            "kiro_crew.messaging.display_safety.redact_for_display",
+            lambda text, redactor: (text, False),
+        )
+        delivered, pending = "a key begins AKIAIOSF", "ODNN7EXAMPLE and more prose"
+        assert severs_a_credential([delivered, pending], _default_redactor), "fixture is inert"
+
+        out = redact_across_delivery(delivered, pending, _default_redactor)
+        assert out != pending, "the completion was shipped unchanged"
+        assert not severs_a_credential([delivered, out], _default_redactor)
+
+    def test_an_innocent_pending_message_is_untouched(self) -> None:
+        assert (
+            redact_across_delivery("all clear here", "and more prose", _default_redactor)
+            == "and more prose"
+        )
+
+    @pytest.mark.parametrize(("head", "tail"), CREDENTIAL_STRADDLE_SHAPES)
+    def test_every_straddle_shape_is_safe_after_the_remedy(self, head: str, tail: str) -> None:
+        assert severs_a_credential([head, tail], _default_redactor), "fixture is inert"
+        out = redact_across_delivery(head, tail, _default_redactor)
+        assert not severs_a_credential([head, out], _default_redactor)
+
+    def test_the_result_carries_no_prose_from_the_delivered_side(self) -> None:
+        """The reader must not see the message above repeated in the one below.
+
+        Redacting the JOIN can emit its CANONICAL form, which differs from the
+        delivered text from the first piece of markup onward -- before the seam, not
+        at it. Slicing that join where it stops matching the delivered bytes
+        therefore cuts at a representation boundary and carries delivered prose into
+        the pending message. Here both sides carry a link and the key is split by
+        one, which is what makes the canonical form the one emitted.
+        """
+        delivered = "see [docs](http://example.com/" + "z" * 40 + ") then AKIA"
+        pending = "[IOSFODNN7EXAMPLE](http://q/" + "z" * 40 + ") and more prose"
+        assert severs_a_credential([delivered, pending], _default_redactor), "fixture is inert"
+
+        out = redact_across_delivery(delivered, pending, _default_redactor)
+
+        assert "docs" not in out, "delivered prose was repeated into the pending message"
+        assert not severs_a_credential([delivered, out], _default_redactor)
+
+    def test_the_completion_is_cut_at_a_word_and_not_a_character(self) -> None:
+        """A cut that stops as soon as the pattern misses leaves the key readable.
+
+        Trimming one character at a time ends at the first length the credential
+        pattern fails to match -- and a key with one character taken out of its
+        middle matches nothing while a reader still reads nineteen of its twenty
+        characters, in order, under the message above. The whole word carrying the
+        completion has to go, so no run of the key survives at all.
+        """
+        key = "AKIAIOSFODNN7EXAMPLE"
+        delivered, pending = "plain lead then AKIAIOSF", "ODNN7EXAMPLE and more prose"
+        assert severs_a_credential([delivered, pending], _default_redactor), "fixture is inert"
+
+        out = redact_across_delivery(delivered, pending, _default_redactor)
+
+        runs = [key[i : i + 6] for i in range(len(key) - 5)]
+        survived = [run for run in runs if run in out]
+        assert not survived, f"a readable run of the key survived the cut: {survived}"
+        assert "and more prose" in out, "the cut took text beyond the completing word"
 
 
 class TestOptionComponents:
