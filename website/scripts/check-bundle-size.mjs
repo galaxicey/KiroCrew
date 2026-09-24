@@ -96,7 +96,23 @@ export const CHUNK_BUDGETS = {
   // module: the chunk holds the same 13 catalogs plus the entry, so shrinking
   // remains unavailable for the reason stated above. Back to the 5% convention
   // over that measurement.
-  all: 12870 * KB, // measured 12254.6 KB on main @ 34fe0de33e 2026-09-21 (5.0% headroom)
+  // Re-measured 2026-09-24: main's own tip @ e4b5f09ed builds the chunk at
+  // 13,171,024 B (12,862.3 KB) against the 12870 KB ceiling -- 7.7 KB left, or
+  // 0.06% headroom, so the gate had begun failing on the merge ref of every open
+  // PR. Same recurrence as the four notes above: the ceiling drifted to under a
+  // tenth of a percent on accumulated catalog copy, so it now fails on the next
+  // feature's ordinary strings rather than on the new library it exists to
+  // catch. Attribution measured, not assumed: this branch (supersede #11609,
+  // Custom font-family option) adds the 15 custom-font catalog keys across the
+  // 12 shipped catalogs plus the regenerated en-XA -- reverting ONLY the files
+  // under `website/src/i18n/` to the base and rebuilding produces the 13,171,024 B
+  // above, so the branch's own contribution is 18,849 B (18.4 KB) of translated
+  // product copy and NO module: the chunk still holds the same 13 catalogs plus
+  // the entry, and no lazy import() boundary can move a catalog string out of
+  // `all`, which is why shrinking is not an option here. Back to the 5%
+  // convention over the measurement that includes this branch (13,189,873 B =
+  // 12,880.7 KB).
+  all: 13525 * KB, // measured 12880.7 KB on branch @ supersede-#11609 2026-09-24 (5.0% headroom)
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
   // named after `src/i18n/t.ts`. Held separately from `all` above because
