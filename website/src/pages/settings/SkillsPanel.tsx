@@ -19,7 +19,7 @@ const PENDING_QUEUE_ROUTE = '/capabilities?tab=skills'
  * analyzed and candidate skills are staged to the pending queue — they never go
  * live without approval unless "Require approval" is turned off.
  *
- * That queue is rendered by `PendingSkillsPanel` on Agent Capabilities →
+ * That queue is rendered by `PendingSkillsPanel` on Customize →
  * Skills, which owns Approve, Dismiss and Dismiss-all. This panel is the place
  * the toggles above put candidates INTO it, so it links there rather than
  * mounting a second copy of the list: one queue with one home cannot disagree

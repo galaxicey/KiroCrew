@@ -15,7 +15,7 @@ superseded-by: []
 # RFC: Global Workflow System — reusable definitions and TaskRunner composition
 
 - Status: implemented — reusable definitions, exact MCP and `/workflow`
-  invocation, the Agent Capabilities library UI, and TaskRunner `task-plan`
+  invocation, the Customize library UI, and TaskRunner `task-plan`
   composition are on `main`. The shipped contract is
   [`../system-specs/modules/workflows.md`](../system-specs/modules/workflows.md).
 - Author: Kyle Seaman, with Codex

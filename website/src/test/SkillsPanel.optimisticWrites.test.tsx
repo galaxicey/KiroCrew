@@ -31,7 +31,7 @@ const AUTO_PATH = 'skills.auto_create_from_sessions'
 
 function wrap(ui: React.ReactElement) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  // MemoryRouter: the panel links to the pending queue on Agent Capabilities →
+  // MemoryRouter: the panel links to the pending queue on Customize →
   // Skills and forwards a `?review=` deep link there, so it needs a router.
   return render(
     <QueryClientProvider client={qc}>
