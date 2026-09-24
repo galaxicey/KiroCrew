@@ -73,16 +73,64 @@ class TestPrepareUpload:
         with pytest.raises(WeComUploadError, match="over the"):
             prepare_upload(b"a" * 11, "file", "f", max_bytes=10)
 
-    def test_rejects_too_many_chunks(self) -> None:
-        # A tiny chunk size forces the count over MAX_CHUNKS while staying small.
-        big = b"a" * (CHUNK_SIZE_BYTES * (MAX_CHUNKS + 1))
-        with pytest.raises(WeComUploadError, match="chunks"):
+    def test_chunk_guard_is_shadowed_by_the_size_cap(self) -> None:
+        # With per-type ceilings (all ≤ 20_000_000 bytes) below
+        # CHUNK_SIZE_BYTES * MAX_CHUNKS (50 MiB), a body large enough to need more
+        # than MAX_CHUNKS chunks is now refused by the SIZE cap first, so the
+        # chunk-count guard is defensive-only. Passing an even larger max_bytes
+        # cannot re-expose it because the per-type cap clamps the effective ceiling.
+        big = b"a" * (CHUNK_SIZE_BYTES * (MAX_CHUNKS + 1))  # ~50 MiB
+        with pytest.raises(WeComUploadError, match="over the"):
             prepare_upload(big, "file", "f", max_bytes=CHUNK_SIZE_BYTES * (MAX_CHUNKS + 2))
 
     @pytest.mark.parametrize("mtype", ["file", "image", "voice", "video"])
     def test_accepts_all_media_types(self, mtype: str) -> None:
-        up = prepare_upload(b"data", mtype, "f", max_bytes=_MAX)
+        up = prepare_upload(b"payload", mtype, "f", max_bytes=_MAX)
         assert up.media_type == mtype
+
+    def test_rejects_at_or_under_five_byte_minimum(self) -> None:
+        # WeCom requires strictly > 5 bytes; 5 and below are refused locally.
+        for n in (1, 5):
+            with pytest.raises(WeComUploadError, match="minimum"):
+                prepare_upload(b"a" * n, "file", "f", max_bytes=_MAX)
+        # 6 bytes is accepted.
+        assert prepare_upload(b"a" * 6, "file", "f", max_bytes=_MAX).total_size == 6
+
+    def test_image_over_two_mb_refused_even_when_caller_ceiling_is_higher(self) -> None:
+        # An image just over the 2 MB image cap is refused, though the caller's
+        # absolute ceiling (20 MiB) would admit it — the per-type cap is stricter.
+        data = b"a" * (2 * 1_000_000 + 1)
+        with pytest.raises(WeComUploadError, match="image is .* over the 2000000-byte limit"):
+            prepare_upload(data, "image", "big.png", max_bytes=_MAX)
+
+    def test_image_at_two_mb_accepted(self) -> None:
+        data = b"a" * (2 * 1_000_000)
+        up = prepare_upload(data, "image", "ok.png", max_bytes=_MAX)
+        assert up.total_size == 2 * 1_000_000
+
+    def test_voice_over_two_mb_refused(self) -> None:
+        data = b"a" * (2 * 1_000_000 + 1)
+        with pytest.raises(WeComUploadError, match="voice is .* over the 2000000-byte limit"):
+            prepare_upload(data, "voice", "clip.amr", max_bytes=_MAX)
+
+    def test_file_between_two_and_twenty_mb_accepted(self) -> None:
+        # A 5 MB file is fine (over the image/voice cap, under the file cap) —
+        # proving the cap is per-type, not a flat 2 MB.
+        data = b"a" * (5 * 1_000_000)
+        up = prepare_upload(data, "file", "report.pdf", max_bytes=_MAX)
+        assert up.total_size == 5 * 1_000_000
+
+    def test_video_uses_file_ceiling(self) -> None:
+        # Video inherits the 20 MB file ceiling: 5 MB is accepted, 20 MB + 1 is not.
+        assert prepare_upload(b"a" * (5 * 1_000_000), "video", "v.mp4", max_bytes=_MAX)
+        with pytest.raises(WeComUploadError, match="video is .* over the 20000000-byte limit"):
+            prepare_upload(b"a" * (20 * 1_000_000 + 1), "video", "v.mp4", max_bytes=_MAX)
+
+    def test_caller_ceiling_still_bounds_when_smaller_than_type_cap(self) -> None:
+        # If the caller passes a ceiling smaller than the type cap, the caller's
+        # wins (effective = min of the two).
+        with pytest.raises(WeComUploadError, match="over the 10-byte limit"):
+            prepare_upload(b"a" * 11, "file", "f", max_bytes=10)
 
 
 class TestFrameBodies:

@@ -606,6 +606,13 @@ class WeComClient:
         The prepare step (md5 + chunking) is CPU-bound on a multi-megabyte body,
         so it runs off the event loop, matching how :mod:`kiro_crew.wecom.media`
         keeps AES-CBC off it.
+
+        ``WECOM_MAX_PLAINTEXT_BYTES`` is the ABSOLUTE (file/video) ceiling; inside
+        :func:`prepare_upload` it is clamped per type against the platform's own
+        published caps (image/voice 2 MB, file/video 20 MB — see
+        ``media_upload.MAX_BYTES_BY_TYPE``), so an oversize image or voice note is
+        refused before the handshake rather than accepted here and rejected by the
+        platform mid-upload.
         """
         upload: MediaUpload = await asyncio.to_thread(
             prepare_upload, data, media_type, filename, max_bytes=WECOM_MAX_PLAINTEXT_BYTES
@@ -624,38 +631,6 @@ class WeComClient:
         if not isinstance(media_id, str) or not media_id:
             raise WeComUploadError("finish response carried no media_id")
         return media_id
-
-    async def send_file(self, req_id: str, media_id: str, *, media_type: str = "file") -> bool:
-        """Reply to an inbound turn with a media object (cmd ``aibot_respond_msg``).
-
-        Routes to the user's chat by replaying the inbound ``req_id``, exactly as
-        :meth:`send_stream` does, but sends ONE ``msgtype:<media_type>`` frame
-        referencing a ``media_id`` from :meth:`upload_media` instead of a text
-        stream. ``media_type`` is the WeCom msgtype (``file`` / ``image`` /
-        ``voice`` / ``video``); the media_id must have been uploaded as that same
-        type.
-
-        Returns whether the frame reached the socket. Like ``send_stream`` there
-        is no per-frame ACK wait: a reply frame replays the inbound req_id, so an
-        ACK cannot be attributed to it (see ``send_stream``'s note).
-        """
-        ws = self._ws
-        if ws is None or ws.closed or not req_id or not media_id:
-            return False
-        frame = {
-            "cmd": "aibot_respond_msg",
-            "headers": {"req_id": req_id},
-            "body": {
-                "msgtype": media_type,
-                media_type: {"media_id": media_id},
-            },
-        }
-        try:
-            await self._ws_send(ws, frame)
-            return True
-        except (ConnectionError, RuntimeError, aiohttp.ClientError) as exc:
-            logger.warning("WeCom file send failed: %s", exc)
-            return False
 
     async def send_file_proactive(
         self, chat_id: str, media_id: str, *, media_type: str = "file"

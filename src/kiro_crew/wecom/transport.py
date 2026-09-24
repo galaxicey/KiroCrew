@@ -108,9 +108,18 @@ WECOM_CAPABILITIES = TransportCapabilities(
     edit=True,
     reactions=False,
     files_inbound=True,
-    files_outbound=True,
     rich_blocks=False,
     threads=False,
+    # ``files_outbound`` gates ONE thing: whether a renderer pulls a local image
+    # reference out of a sealed reply segment and uploads it inline (the flag the
+    # Discord/Teams/Telegram renderers read before extracting). WeCom ships no such
+    # renderer extraction path, so the flag stays False and an inline reference
+    # keeps printing its path — the honest degradation. This is INDEPENDENT of the
+    # ``file_send`` document path this change adds: that path is gated by
+    # ``upload_destination.DOCUMENT_CHANNELS`` + the ``send_document`` verb, never
+    # by this flag, so declaring True here would be functionally inert while making
+    # the capability ledger claim an extraction WeCom does not do.
+    files_outbound=False,
     # Keep canonical tables: an adaptive representation can exceed the cap while
     # the only shorter raw candidate still contains a value that display-form
     # redaction would remove. That reason is independent of the overflow path the
@@ -317,6 +326,14 @@ class WeComTransport(MessagingTransport):
         (``send_file_proactive``) — the ``aibot_send_msg`` path, matching
         :meth:`send_message`'s mirror/cron semantics.
 
+        A non-empty ``caption`` is delivered as a companion text push AFTER the
+        file lands (WeCom's media frame carries no text field, unlike
+        Telegram/Discord which fold the caption into the upload). It is
+        best-effort: the file is already delivered, so a failed caption push is
+        logged and does not turn a landed file into a reported failure — the
+        alternative, silently dropping the user's typed description, is what this
+        addresses.
+
         Takes an :class:`OutboundFile` whose ``data`` the file_send gates already
         validated; the upload uses those bytes, never re-opening the path.
         ``conversation_id`` is the userid (see :meth:`resolve_conversation`).
@@ -343,6 +360,16 @@ class WeComTransport(MessagingTransport):
         wecom_type = wecom_media_type_for(filename)
         try:
             media_id = await self._client.upload_media(document.data, wecom_type, filename)
+            # Re-authorize AFTER the upload, before the push. The check above and
+            # the push below straddle the chunked upload handshake — a multi-second,
+            # multi-await window on a large body — and the allow-list can be
+            # replaced inside it by a live `reconfigure` (a departing/compromised
+            # userid revoked mid-upload). A media frame cannot be recalled once the
+            # ACK lands, so the authorization decision must be fresh at each send
+            # boundary, not carried across the upload.
+            if not self._may_push(conversation_id):
+                logger.warning("wecom send_document: conversation deauthorized during upload")
+                return None
             if not await self._client.send_file_proactive(
                 conversation_id, media_id, media_type=wecom_type
             ):
@@ -353,6 +380,28 @@ class WeComTransport(MessagingTransport):
             # class is enough for an operator, matching the client's own logging.
             logger.warning("wecom send_document failed: %s", type(exc).__name__)
             return None
+        # The caller's typed description rides alongside the file. WeCom's media
+        # frame (media_type:{media_id}) has no text field — unlike Telegram/Discord
+        # which fold the caption into the upload — so it must go as a separate
+        # aibot_send_msg text push. Best-effort AFTER the confirmed file send: the
+        # file already reached the user, so a dropped caption is logged and the
+        # send still counts as delivered. Dropping it silently (the prior
+        # behaviour) is what made the user's description vanish without a trace.
+        if caption:
+            # The caption is a SECOND delivery, past its own await (the file
+            # push + ACK), so it needs its own fresh authorization: the roster
+            # can be revoked between the file landing and this push, and the
+            # caption must not reach a recipient who lost access in that gap.
+            if not self._may_push(conversation_id):
+                logger.warning("wecom send_document: conversation deauthorized before caption")
+            else:
+                try:
+                    if not await self._client.send_proactive(conversation_id, caption):
+                        logger.warning("wecom send_document: caption push not acknowledged")
+                except Exception as exc:  # noqa: BLE001 — companion leg; file already sent
+                    logger.warning(
+                        "wecom send_document caption push failed: %s", type(exc).__name__
+                    )
         # WeCom carries no message id on aibot_send_msg (returns_message_id=False),
         # but the channel-upload caller treats a FALSY return (`""`/None) as a
         # delivery failure (`if not mid`). A confirmed proactive send above IS a

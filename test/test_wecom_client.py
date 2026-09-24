@@ -877,7 +877,7 @@ class TestUploadMedia:
 
         # Small file → single chunk → init, chunk, finish (3 frames).
         async def drive_responses() -> str:
-            return await client.upload_media(b"hello", "file", "greet.txt")
+            return await client.upload_media(b"hello!", "file", "greet.txt")
 
         task = asyncio.create_task(drive_responses())
         # Let upload_media run until it parks on the init response.
@@ -925,7 +925,7 @@ class TestUploadMedia:
         client = _make_client()
         client._ws = fake_ws  # type: ignore[assignment]
 
-        task = asyncio.create_task(client.upload_media(b"hi", "file", "f.txt"))
+        task = asyncio.create_task(client.upload_media(b"hi there", "file", "f.txt"))
         await asyncio.sleep(0.05)
         await _feed_response(
             client,
@@ -946,7 +946,7 @@ class TestUploadMedia:
         client = _make_client()
         client._ws = fake_ws  # type: ignore[assignment]
 
-        task = asyncio.create_task(client.upload_media(b"hi", "file", "f.txt"))
+        task = asyncio.create_task(client.upload_media(b"hi there", "file", "f.txt"))
         await asyncio.sleep(0.05)
         await _feed_response(
             client,
@@ -969,7 +969,7 @@ class TestUploadMedia:
         client = _make_client()
         client._ws = None
         with pytest.raises(WeComUploadError, match="no live"):
-            await client.upload_media(b"hi", "file", "f.txt")
+            await client.upload_media(b"hi there", "file", "f.txt")
 
     async def test_pending_responses_does_not_disturb_pending_acks(self) -> None:
         # A stream/proactive int-ACK still routes to _pending_acks even while an
@@ -992,43 +992,3 @@ class TestUploadMedia:
         )
         assert ack_waiter.result() == 0
         assert not resp_waiter.done()  # untouched
-
-
-class TestSendFile:
-    pytestmark = pytest.mark.asyncio
-
-    async def test_reply_frame_structure(self) -> None:
-        fake_ws = FakeWS()
-        client = _make_client()
-        client._ws = fake_ws  # type: ignore[assignment]
-
-        result = await client.send_file("req-1", "MID42")
-
-        assert result is True
-        frame = fake_ws.sent[0]
-        assert frame["cmd"] == "aibot_respond_msg"
-        assert frame["headers"]["req_id"] == "req-1"
-        assert frame["body"]["msgtype"] == "file"
-        assert frame["body"]["file"]["media_id"] == "MID42"
-
-    async def test_image_media_type(self) -> None:
-        fake_ws = FakeWS()
-        client = _make_client()
-        client._ws = fake_ws  # type: ignore[assignment]
-
-        await client.send_file("req-1", "MID", media_type="image")
-        frame = fake_ws.sent[0]
-        assert frame["body"]["msgtype"] == "image"
-        assert frame["body"]["image"]["media_id"] == "MID"
-
-    async def test_returns_false_without_ws(self) -> None:
-        client = _make_client()
-        client._ws = None
-        assert await client.send_file("req-1", "MID") is False
-
-    async def test_returns_false_without_media_id(self) -> None:
-        fake_ws = FakeWS()
-        client = _make_client()
-        client._ws = fake_ws  # type: ignore[assignment]
-        assert await client.send_file("req-1", "") is False
-        assert len(fake_ws.sent) == 0

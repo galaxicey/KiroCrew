@@ -48,13 +48,44 @@ logger = logging.getLogger(__name__)
 CHUNK_SIZE_BYTES = 512 * 1024
 
 #: WeCom's per-message chunk ceiling. total_size therefore cannot exceed
-#: CHUNK_SIZE_BYTES * MAX_CHUNKS = 50 MiB by this limit; the file-type ceiling
-#: (WECOM_MAX_PLAINTEXT_BYTES, 20 MiB) is stricter and is what the caller enforces.
+#: CHUNK_SIZE_BYTES * MAX_CHUNKS = 50 MiB by this limit; the per-type ceilings
+#: (:data:`MAX_BYTES_BY_TYPE` — 2 MB image/voice, 20 MB file/video) are all
+#: stricter and are what :func:`prepare_upload` enforces.
 MAX_CHUNKS = 100
 
 #: Outbound media types WeCom accepts for temporary material. ``msgtype`` on the
 #: eventual send frame is the same string.
 MEDIA_TYPES = frozenset({"file", "image", "voice", "video"})
+
+#: WeCom's minimum: every uploaded object must be strictly larger than 5 bytes.
+#: Documented on the file-upload interface at
+#: https://developer.work.weixin.qq.com/document/path/91770 ("所有类型的文件大小均
+#: 要求大于5个字节").
+MIN_MEDIA_BYTES = 5
+
+#: Per-type upload ceilings, from WeCom's published message-push / upload docs
+#: (https://developer.work.weixin.qq.com/document/path/91770):
+#:
+#:   * image (image type message): base64-decoded content ≤ 2 MB, JPG/PNG.
+#:   * voice (voice type message): ≤ 2 MB, ≤ 60 s playback, AMR only.
+#:   * file  (file  type message): ≤ 20 MB.
+#:
+#: The doc's webhook upload interface documents no separate ``video`` ceiling —
+#: video is uploaded as ordinary temporary material — so it inherits the ``file``
+#: ceiling (20 MB) rather than being clamped tighter than the platform requires.
+#: These replace the single 20 MB ceiling the caller used to pass for every type,
+#: so an image or voice note over its own (smaller) limit is refused BEFORE the
+#: handshake instead of being accepted locally and then rejected by the platform.
+#: 2 MB / 20 MB here mean the decimal-MB the docs quote (2_000_000 / 20_000_000),
+#: not MiB — a value the platform states in "M" is safest read as the smaller
+#: decimal megabyte so a 2 MiB image (over 2 MB) is not offered and refused.
+_MB = 1_000_000
+MAX_BYTES_BY_TYPE: dict[str, int] = {
+    "image": 2 * _MB,
+    "voice": 2 * _MB,
+    "file": 20 * _MB,
+    "video": 20 * _MB,
+}
 
 #: WS command names for the three-step handshake. Inlined at the frame like the
 #: rest of this module's siblings do (client.py builds aibot_respond_msg etc.
@@ -132,23 +163,45 @@ def prepare_upload(data: bytes, media_type: str, filename: str, *, max_bytes: in
     the event loop (``asyncio.to_thread``), matching how :mod:`kiro_crew.wecom.media`
     keeps AES off the loop.
 
-    Raises :class:`WeComUploadError` for an unknown type, an empty body, a body
-    over *max_bytes* (the caller's file-type ceiling), or one needing more than
-    :data:`MAX_CHUNKS` chunks — all refused before a frame is built rather than
-    after the platform rejects the handshake mid-flight.
+    The size ceiling is PER TYPE: the effective limit is the smaller of *max_bytes*
+    (the caller's absolute file ceiling) and this type's own published cap
+    (:data:`MAX_BYTES_BY_TYPE` — image/voice 2 MB, file/video 20 MB, per
+    https://developer.work.weixin.qq.com/document/path/91770). So an image or
+    voice note over its own smaller limit is refused HERE, before a frame is built,
+    rather than accepted locally and then rejected by the platform mid-handshake.
+
+    Raises :class:`WeComUploadError` for an unknown type, a body at or below the
+    5-byte platform minimum (:data:`MIN_MEDIA_BYTES`), a body over the effective
+    ceiling, or one needing more than :data:`MAX_CHUNKS` chunks — all refused
+    before a frame is built rather than after the platform rejects the handshake
+    mid-flight.
     """
     if media_type not in MEDIA_TYPES:
         raise WeComUploadError(f"unsupported media type {media_type!r}")
     if not data:
         raise WeComUploadError("cannot upload an empty file")
     total_size = len(data)
-    if total_size > max_bytes:
-        raise WeComUploadError(f"file is {total_size} bytes, over the {max_bytes}-byte limit")
+    # WeCom requires every object to be strictly LARGER than 5 bytes; a 1-5 byte
+    # body is accepted by the local chunker but refused by the platform, so refuse
+    # it here with a clear reason instead.
+    if total_size <= MIN_MEDIA_BYTES:
+        raise WeComUploadError(
+            f"file is {total_size} bytes, at or under WeCom's {MIN_MEDIA_BYTES}-byte minimum"
+        )
+    # Effective ceiling = min(caller's absolute file ceiling, this type's own cap).
+    # An unknown type never reaches here (guarded above); a known type always has
+    # an entry, so ``.get`` falls back to the caller's ceiling only defensively.
+    type_cap = MAX_BYTES_BY_TYPE.get(media_type, max_bytes)
+    effective_max = min(max_bytes, type_cap)
+    if total_size > effective_max:
+        raise WeComUploadError(
+            f"{media_type} is {total_size} bytes, over the {effective_max}-byte limit"
+        )
     chunks = _split_chunks(data)
     if len(chunks) > MAX_CHUNKS:
-        # Unreachable while max_bytes (20 MiB) < CHUNK_SIZE_BYTES * MAX_CHUNKS
-        # (50 MiB), but checked so a future ceiling bump cannot silently produce
-        # an over-limit handshake.
+        # Unreachable while every effective ceiling (≤ 20_000_000 bytes) stays
+        # below CHUNK_SIZE_BYTES * MAX_CHUNKS (50 MiB), but checked so a future
+        # ceiling bump cannot silently produce an over-limit handshake.
         raise WeComUploadError(f"file needs {len(chunks)} chunks, over the {MAX_CHUNKS} limit")
     # WeCom's upload protocol mandates an md5 integrity tag; it is a wire
     # checksum, not a security hash. usedforsecurity=False states that intent.
