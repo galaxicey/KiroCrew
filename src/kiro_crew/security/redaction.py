@@ -892,6 +892,129 @@ def _text_contains_bare_secret(text: str) -> bool:
     return any(_contains_bare_secret(match.group()) for match in _BARE_SECRET_RUN_RE.finditer(text))
 
 
+#: Code-point ranges of the printable-ASCII tail of the standard baseline JPEG AC
+#: Huffman symbol table -- the ``HUFFVAL`` list of ITU-T T.81 Annex K, Table K.5 --
+#: in the order the table writes them. Everything before and after this tail is
+#: outside printable ASCII, so a container holding the standard table delimits
+#: exactly these characters with its own non-text bytes.
+#:
+#: Assembled from the ranges rather than pasted as a literal on purpose: the
+#: assembled string IS the credential shape this masker exists to cancel, so a
+#: pasted copy reads as key material to every secret scanner over this file.
+_BASELINE_SYMBOL_TABLE_RANGES: tuple[tuple[int, int], ...] = (
+    (0x25, 0x2A),
+    (0x34, 0x3A),
+    (0x43, 0x4A),
+    (0x53, 0x5A),
+    (0x63, 0x6A),
+    (0x73, 0x7A),
+)
+
+#: The ONE fixed 45-character string the container false positive is made of.
+#: Masking is pinned to this value, which is what bounds the masker: the only
+#: characters it can ever remove are characters of this constant, so no
+#: attacker-supplied byte is removable and no generated credential is maskable.
+_BASELINE_SYMBOL_TABLE = "".join(
+    chr(code) for low, high in _BASELINE_SYMBOL_TABLE_RANGES for code in range(low, high + 1)
+)
+
+#: Shortest slice of :data:`_BASELINE_SYMBOL_TABLE` any detector in this module
+#: flags. Measured against the catalogue, not chosen: every shorter slice already
+#: passes the scan unmasked, so masking one could not change an answer, and
+#: ``test_no_shorter_slice_of_the_table_is_flagged`` fails if that stops holding.
+#: It is the region floor below, which is what keeps this cheap on real media: a
+#: 400 KB photograph holds tens of thousands of text runs and exactly one this
+#: long.
+_BASELINE_SYMBOL_TABLE_MIN = 37
+
+#: Masked regions retained before this gives up and returns the buffer UNMASKED.
+#: The bound matters because the region floor is 37 text bytes, so a crafted 50 MB
+#: upload could carry over a million qualifying regions and the retained slices
+#: would amplify it several times over in memory. Real containers are nowhere near
+#: it -- one table per embedded image -- and exceeding it returns the unmasked
+#: buffer, which is the REFUSING direction: the scan then answers exactly as it
+#: did before this masker existed.
+_MASKED_REGION_CAP = 4096
+
+#: Substituted for every character of a masked table. A space, and whitespace is
+#: the property that matters: every credential value class carrying no literal
+#: label excludes whitespace -- ``[^\s"',}]+``, ``[^\s/]+@``, ``[^\s:/@]*`` and
+#: ``_BARE_SECRET_RUN_RE``'s ``[A-Za-z0-9+/]`` all reject it -- so blanking can
+#: only END a value run, never extend one into a match the raw bytes did not have.
+_MASKED_TABLE_FILLER = " "
+
+#: A maximal region of TEXT bytes -- the only bytes a credential can be written
+#: in. Maximality is load-bearing rather than an optimisation: a region is bounded
+#: by non-text bytes, so a region equal to the table is one a container delimited,
+#: and any credential written beside a table shares the table's region and makes
+#: it unmaskable.
+#:
+#: The floor is :data:`_BASELINE_SYMBOL_TABLE_MIN`, so the regex engine skips a
+#: shorter run in one C-speed pass and Python never sees it.
+_TEXT_REGION_RE = re.compile(r"[\t\n\r\x20-\x7e]{%d,}" % _BASELINE_SYMBOL_TABLE_MIN)
+
+
+def mask_baseline_symbol_tables(text: str) -> str:
+    """Blank the standard container symbol tables in *text*, leaving all else.
+
+    For the BINARY delivery scans only. A JPEG's ``DHT`` segment carries the
+    standard baseline Huffman symbol table, and that table's printable tail reads
+    as six digits, a colon and thirty-two letters -- exactly the shape of an
+    unlabelled bot token. Every image written with the default tables holds it,
+    including a blank 694-byte one carrying no metadata at all, so the shared
+    binary delivery scan refuses essentially every such image.
+
+    The detectors cannot see this on their own. Their entropy floor scores the
+    character multiset, and the table's characters are all distinct, so it scores
+    the full bits per character a generated secret does.
+
+    A region is masked only when it EQUALS a contiguous slice of
+    :data:`_BASELINE_SYMBOL_TABLE`, one fixed public 45-character constant. That is
+    the whole safety argument and it needs no reasoning about shapes: the only
+    characters this function can remove are characters of that constant, so it
+    cannot remove an attacker's byte, and a value is maskable only if the attacker
+    already knows it. A credential-shaped run that merely resembles a table --
+    ascending, high-diversity, delimited -- is not a slice of the constant and
+    keeps its whole match.
+
+    Whole-region equality is what keeps a table from covering for a neighbour.
+    Regions are maximal, so a table written next to a credential shares one region
+    with it, that region is longer than the constant, and neither is masked. The
+    same holds in the other direction: a credential whose match runs INTO the
+    table's characters cannot have those characters taken away, because the region
+    carrying both is not a slice of the constant either.
+
+    The TEXT path deliberately keeps the unmasked scan. There a match costs a
+    redaction tag; here it costs the delivery of the file, and the only way past
+    that refusal is the durable class-wide grant in
+    :mod:`kiro_crew.file_delivery_consent`, which then disarms the refusal for
+    every content kind on every owner-facing gate. Noise on this path spends the
+    control, so this path is where the noise has to go.
+
+    Returns *text* ITSELF when nothing is masked, which the callers read as
+    identity to skip re-scanning a buffer whose answer they already hold.
+    """
+    pieces: list[str] = []
+    cursor = 0
+    masked = 0
+    for match in _TEXT_REGION_RE.finditer(text):
+        if match.group() not in _BASELINE_SYMBOL_TABLE:
+            continue
+        masked += 1
+        if masked > _MASKED_REGION_CAP:
+            # Bounded, and bounded towards refusal: the caller re-scans the
+            # unmasked buffer and answers as it did before this masker existed.
+            return text
+        start, end = match.span()
+        pieces.append(text[cursor:start])
+        pieces.append(_MASKED_TABLE_FILLER * (end - start))
+        cursor = end
+    if not pieces:
+        return text
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
 # Standard replacement tag for a redacted credential. Shared between the batch
 # redactor (`redact_credentials`) and the streaming fail-closed path
 # (`StreamRedactor.feed`) so the on-the-wire marker is identical everywhere.
