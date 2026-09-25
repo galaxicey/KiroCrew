@@ -53,17 +53,20 @@ function PlainFallbackHeader({ children }: { children: ReactNode }) {
 /**
  * The header row of the simplified file-pair fallback: the caller's prefix
  * slot (the card's expand/collapse control), the filename, the caller's
- * filename suffix, an optional state label, and the caller's metadata.
+ * filename suffix, an optional state label, the caller's metadata, and the
+ * caller's actions.
  *
- * Exported because the opted-in oversized pair keeps THIS row as its header
- * once the line-by-line diff replaces the two-side body. Pierre's own header
- * exists only while its renderer has a highlight result to draw — none while
- * the worker pool is still initialising, recovering, or unavailable, none for
- * a patch that will not parse, none at all in plain-diff mode — so a control
- * slotted into it would vanish in every one of those states. One row, the same
- * component before and after the swap; only the body beneath it changes.
+ * Exported because two surfaces keep THIS row as their header for the whole
+ * life of the card and let Pierre draw the body only: the opted-in oversized
+ * pair once the line-by-line diff replaces the two-side body, and the chat diff
+ * block in every state. Pierre's own header exists only while its renderer has
+ * a highlight result to draw — none while the worker pool is still
+ * initialising, recovering, or unavailable, none for a patch that will not
+ * parse, none at all in plain-diff mode — so a control slotted into it would
+ * vanish in every one of those states. One row, the same component in every
+ * state; only the body beneath it changes.
  */
-export function PlainFilePairHeader({ filename, titleId, label, titleClickable, stats, renderHeaderPrefix, renderHeaderFilenameSuffix, renderHeaderMetadata }: {
+export function PlainFilePairHeader({ filename, titleId, label, titleClickable, stats, renderHeaderPrefix, renderHeaderFilenameSuffix, renderHeaderMetadata, renderHeaderActions }: {
   filename: string
   titleId?: string
   label?: string
@@ -73,13 +76,22 @@ export function PlainFilePairHeader({ filename, titleId, label, titleClickable, 
    *  caller's `unsafeCSS`, which is scoped to Pierre's shadow root and cannot
    *  reach this row. */
   titleClickable?: boolean
-  /** Exact added/removed line counts, rightmost like Pierre's own — only the
-   *  opted-in state has them (from its computed patch); the fallback's bounded
-   *  scan cannot count lines and passes none. */
+  /** Exact added/removed line counts, rightmost like Pierre's own. The
+   *  opted-in pair reads them off its computed patch and the chat diff block
+   *  off the patch it renders; the fallback's bounded scan cannot count lines
+   *  and passes none. */
   stats?: { added: number; removed: number }
   renderHeaderPrefix?: () => ReactNode
   renderHeaderFilenameSuffix?: () => ReactNode
+  /** The file row's diffstat indicator: drawn INSIDE the metadata group, before
+   *  the counts, in the fixed-width box that keeps it at one x across rows. */
   renderHeaderMetadata?: () => ReactNode
+  /** The caller's action cluster, drawn BEFORE the counts — where Pierre's own
+   *  header shows its metadata slot, which is where the chat diff block's
+   *  Open / layout / Copy controls sit when Pierre draws that header — so the
+   *  counts stay rightmost. Outside the metadata group: a cluster is wider than
+   *  the indicator's box, and it aligns to the counts rather than to a column. */
+  renderHeaderActions?: () => ReactNode
 }) {
   const metadata = renderHeaderMetadata?.()
   const removed = stats?.removed ?? 0
@@ -98,12 +110,15 @@ export function PlainFilePairHeader({ filename, titleId, label, titleClickable, 
         {renderHeaderFilenameSuffix?.()}
         {label != null && <span className="text-[11px] font-normal text-muted">{label}</span>}
       </div>
+      {renderHeaderActions?.()}
       {/* The same group Pierre's header draws — the caller's metadata (its
           diffstat indicator) pinned left, the ±counts pinned right, in a box of
           fixed width — so the indicator starts at the same x on this row as on
-          the within-budget rows around it, whether or not a count is present. */}
+          the within-budget rows around it, whether or not a count is present.
+          The box is pinned only when there is an indicator to align: counts on
+          their own sit together at the row's edge, as in Pierre's header. */}
       {(metadata != null || removed > 0 || added > 0) && (
-        <div data-metadata className="flex shrink-0 items-center gap-2" style={HEADER_META_GROUP_STYLE}>
+        <div data-metadata className="flex shrink-0 items-center gap-2" style={metadata != null ? HEADER_META_GROUP_STYLE : undefined}>
           {metadata}
           {removed > 0 && <span data-deletions-count="" className="font-mono text-danger" style={HEADER_COUNT_STYLE}>-{removed}</span>}
           {added > 0 && <span data-additions-count="" className="font-mono text-ok" style={HEADER_COUNT_STYLE}>+{added}</span>}
