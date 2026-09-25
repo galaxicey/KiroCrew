@@ -622,6 +622,40 @@ def _warn_on_systematic_scan_failure(directory: Path, candidates: int, parsed: i
         )
 
 
+def _project_scope_denied(
+    project_dir: str | Path,
+    *,
+    operation: str,
+    source: str,
+) -> bool:
+    """``True`` when *project_dir* is a protected tree, recorded as a denial.
+
+    The one guard every reader of a caller-supplied project scope shares, so the
+    decision and the audited refusal cannot drift apart between them. Call it
+    BEFORE any filesystem access under *project_dir* -- a ``scandir`` or a
+    ``stat`` pair under a protected root is already a read of that tree, so a
+    guard placed after one records a denial for a read that happened.
+
+    *operation*/*source* label the SEL denial event, exactly as on
+    :func:`_read_agent_spec`: the calling surface names itself so the security
+    trail attributes the refusal to the request that triggered it.
+
+    The audit is best-effort by :func:`_audit_denied` -- the caller's refusal
+    stands either way, so a lost row costs the trail, never the guard (see the
+    denial-audit rule in ``docs/architecture/security-deep-dive.md``).
+    """
+    if not is_sensitive_path(str(project_dir)):
+        return False
+    logger.debug("Skipping sensitive project dir for agent discovery: %s", project_dir)
+    _audit_denied(
+        operation=operation,
+        source=source,
+        resources=str(project_dir),
+        error="sensitive project dir rejected",
+    )
+    return True
+
+
 def project_agent_files(
     project_dir: str | Path | None,
     include_legacy: bool = False,
@@ -668,20 +702,10 @@ def project_agent_files(
     """
     if not project_dir:
         return []
-    if is_sensitive_path(str(project_dir)):
-        logger.debug("Skipping sensitive project dir for agent discovery: %s", project_dir)
-        # Audited like every other deny in this module: the path arrives from a
-        # caller-supplied session, spawn or channel field, so a scan of a
-        # protected tree is a probe an operator must be able to see. Best-effort
-        # by :func:`_audit_denied` -- the refusal below already stands, so a lost
-        # row costs the trail, never the guard (see the denial-audit rule in
-        # ``docs/architecture/security-deep-dive.md``).
-        _audit_denied(
-            operation=operation,
-            source=source,
-            resources=str(project_dir),
-            error="sensitive project dir rejected",
-        )
+    # Audited like every other deny in this module: the path arrives from a
+    # caller-supplied session, spawn or channel field, so a scan of a protected
+    # tree is a probe an operator must be able to see.
+    if _project_scope_denied(project_dir, operation=operation, source=source):
         return []
     specs: list[Path] = []
     try:
@@ -782,14 +806,7 @@ def project_agent_names(
     # even a stat pair under ~/.aws etc. is probing a protected tree. Denied
     # loudly — the SEL record is what lets an operator see a spawn_run/cwd probe
     # at a protected path, matching every other deny in this module.
-    if is_sensitive_path(key):
-        logger.debug("Skipping sensitive project dir for agent discovery: %s", project_dir)
-        _audit_denied(
-            operation=operation,
-            source=source,
-            resources=key,
-            error="sensitive project dir rejected",
-        )
+    if _project_scope_denied(key, operation=operation, source=source):
         return frozenset()
     signature = _project_signature(project_dir)
     cached = _PROJECT_NAMES_CACHE.get(key)
@@ -1722,19 +1739,34 @@ def list_agents(
     would offer an agent that cannot run.
 
     Omitting *project_dir* preserves the user-level-only behavior, which is what
-    callers with no session context (and therefore no project) want.
+    callers with no session context (and therefore no project) want. A
+    *project_dir* under a protected tree is refused whole and answered the same
+    way: the value arrives from a caller-supplied session field, so nothing --
+    not the spec scan, not the cache signature's stats -- reads under it.
 
     Results are cached per scope pair and reused while both directory signatures
     are unchanged, so repeated calls avoid re-reading and re-parsing every agent
     JSON on the event loop.
     """
     d = agents_dir or _kiro_agents_dir()
-    project_files = project_agent_files(project_dir, operation="list_agents", source="unknown")
-    cache_key = (str(d), str(project_dir or ""))
+    # The project scope's sensitivity is decided BEFORE anything reads under it.
+    # The signature stats below are a `scandir` plus a `stat` per entry, so
+    # building them for a refused root would read the tree this refusal exists to
+    # protect — and record a denial for it. A refused scope is dropped whole
+    # rather than refused per read: it contributes no specs, no signature and no
+    # cache key, leaving the user-level result it shares with a project-less call.
+    scope: str | Path | None = project_dir or None
+    if scope is not None and _project_scope_denied(
+        scope, operation="list_agents", source="unknown"
+    ):
+        scope = None
+    project_files = project_agent_files(scope, operation="list_agents", source="unknown")
+    cache_key = (str(d), str(scope or ""))
     signature: tuple[_ListAgentsSig, ...] = (
         _dir_signature(d),
-        _dir_signature(project_kiro_dir(project_dir)) if project_dir else (),
-        _dir_signature(project_agents_dir(project_dir)) if project_dir else (),
+        # The same pair :func:`_project_signature` computes, through that helper
+        # so the two entry points cannot diverge again.
+        *(_project_signature(scope) if scope else ((), ())),
     )
     cached = _LIST_AGENTS_CACHE.get(cache_key)
     if cached is not None and cached[0] == signature:
@@ -1854,9 +1886,9 @@ def list_agents(
         except Exception:
             logger.debug("Skipping invalid project agent config: %s", pf)
             continue
-    if project_dir:  # type narrowing only; without it candidates is 0 anyway
+    if scope:  # type narrowing only; without it candidates is 0 anyway
         _warn_on_systematic_scan_failure(
-            project_agents_dir(project_dir), project_candidates, project_parsed
+            project_agents_dir(scope), project_candidates, project_parsed
         )
 
     result = list(seen.values())

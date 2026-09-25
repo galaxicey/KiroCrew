@@ -1312,7 +1312,23 @@ _EXPECTED_STRICT_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
 }
 
 
+# The guard those three paths share. It is not a reader -- it decides, and emits
+# the denial row when the answer is "protected tree" -- but it is where the
+# ``operation``/``source`` pair now reaches the log, so a literal written here in
+# place of a forward would erase the asking surface from every denial the
+# enclosing function records. ``list_agents`` is the one in-module caller that IS
+# the surface, so its literals are the pinned exception.
+_EXPECTED_SCOPE_GUARD_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
+    "kiro_crew/agent_discovery.py": [
+        ("forward:operation", "forward:source"),
+        ("forward:operation", "forward:source"),
+        ("list_agents", "unknown"),
+    ],
+}
+
+
 _RATCHET_INVENTORY: dict[str, dict[str, list[tuple[str, str]]]] = {
+    "_project_scope_denied": _EXPECTED_SCOPE_GUARD_CALL_SITE_LABELS,
     "_read_agent_spec": _EXPECTED_CALL_SITE_LABELS,
     "parsed_agent_specs": _EXPECTED_PARSED_SPECS_CALL_SITE_LABELS,
     "project_agent_files": _EXPECTED_PROJECT_FILES_CALL_SITE_LABELS,

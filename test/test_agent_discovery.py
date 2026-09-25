@@ -152,6 +152,58 @@ class TestProjectScopeDiscovery:
         (_project_agents_dir(proj) / "a.json").write_text(json.dumps({"name": "a"}))
         assert project_agent_files(str(proj)) == []
 
+    def test_list_agents_sensitive_project_dir_denied_before_any_stat(
+        self, fake_home, tmp_path, monkeypatch
+    ):
+        """``list_agents`` refuses a sensitive project dir BEFORE stating under it.
+
+        The sibling pin
+        ``TestProjectAgentNameCache.test_sensitive_project_dir_denied_before_any_stat``
+        patches ``_project_signature``, which this entry point does not call, so
+        it leaves this scope's ordering uncovered.
+
+        Regression: the refusal yielded no project specs and the cache signature
+        was then built from ``_dir_signature`` on both project scopes anyway -- a
+        ``scandir`` plus a ``stat`` per entry under the tree the refusal had just
+        protected, while the recorded outcome said denied. The user-level scope
+        still lists, and the one refusal still owes exactly one denial row.
+        """
+        import kiro_crew.agent_discovery as ad
+
+        d = _agents_dir(fake_home)
+        (d / "user-level.json").write_text(json.dumps({"name": "user-level"}))
+        secret = tmp_path / "secret"
+        (_project_agents_dir(secret) / "a.json").write_text(json.dumps({"name": "a"}))
+        monkeypatch.setattr(
+            "kiro_crew.agent_discovery.is_sensitive_path",
+            lambda p: str(p) == str(secret),
+        )
+        real_signature = ad._dir_signature
+
+        def _refuse_under_secret(target):
+            # Scoped to the refused tree: the user-level scope legitimately
+            # stats, so a blanket failure here would fire on every call and
+            # prove nothing about the ordering.
+            if str(secret) in str(target):
+                pytest.fail(f"signature stat ran under a refused project dir: {target}")
+            return real_signature(target)
+
+        monkeypatch.setattr(ad, "_dir_signature", _refuse_under_secret)
+        sel_events: list[dict] = []
+        monkeypatch.setattr(
+            ad,
+            "_sel",
+            lambda: SimpleNamespace(log_api_access=lambda **kw: sel_events.append(kw)),
+        )
+        clear_list_agents_cache()
+
+        names = [a.name for a in list_agents(agents_dir=d, project_dir=str(secret))]
+
+        assert names == ["user-level"]
+        assert [e["outcome"] for e in sel_events] == ["denied"], (
+            f"one refusal owes exactly one denial row: {sel_events}"
+        )
+
     def test_missing_project_kiro_dir_is_not_an_error(self, tmp_path):
         """A checkout with no ``.kiro`` yields no agents rather than raising."""
         assert project_agent_files(str(tmp_path / "no-kiro")) == []
