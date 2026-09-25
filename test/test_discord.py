@@ -955,12 +955,33 @@ class TestRotationSplitting:
         A tail that scans markup-bearing alone -- e.g. an image reference
         whose guarding backslash sealed away -- would otherwise upload a
         source-literal file at the semantic seal. The rotation must fail
-        closed.
+        closed. Measured on the SOURCE head so an escaped trailing space that
+        _seal would strip does not read as debt.
         """
         r, _ = self._renderer(monkeypatch, 60)
-        r._buf = ["x" * 58 + "\\ short tail here"]
+        # Cut lands right after a lone backslash; the tail opens with markup the
+        # backslash escapes in the full text.
+        r._buf = ["y" * 59 + "\\" + "![c](/tmp/c.png) tail"]
         await r._rotate_on_length()
         assert r._segment_uploads_safe is False
+
+    @pytest.mark.asyncio
+    async def test_an_escaped_trailing_space_is_not_escape_debt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A backslash that escapes a real trailing space is not escape debt.
+
+        The run must be read on the SOURCE head, not the sealed chunk: _seal
+        rstrips its body, so measuring the stripped text would report debt for
+        a boundary after ``\\`` + whitespace (a markdown hard break, or a
+        backslash escaping a stripped space) where nothing straddles the seam
+        (Opus finding). Uploads stay eligible.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        r._buf = ["x" * 58 + "\\ short tail here"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
 
     @pytest.mark.asyncio
     async def test_a_clean_seal_keeps_uploads_eligible(
@@ -970,6 +991,134 @@ class TestRotationSplitting:
         r, _ = self._renderer(monkeypatch, 60)
         assert r._segment_uploads_safe is True
         r._buf = ["x" * 58 + " short tail here"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
+
+    @pytest.mark.asyncio
+    async def test_inline_code_debt_is_judged_within_its_own_block(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Inline-code debt at the cut is judged per BLOCK, like the extraction
+        model, not against the whole masked head (Opus finding).
+
+        A lone backtick in an earlier paragraph must not pair across a blank
+        line to cancel the inline-code opener the cut lands inside -- masking
+        the whole head did that and let a literal reference reach the tail as a
+        real upload. The opener is unclosed in ITS block, so the rotation must
+        fail closed.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # Paragraph 1 carries a lone backtick; paragraph 2 opens an inline-code
+        # run that is still open where the over-limit line is cut.
+        r._buf = ["a ` char here\n\n`" + "y" * 70 + "\n"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is False
+
+    @pytest.mark.asyncio
+    async def test_an_open_fence_does_not_fake_inline_code_debt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An over-limit fenced block must not read as inline-code debt (Opus
+        finding).
+
+        Masking the whole head left the fence's own unpaired delimiter run as a
+        surviving backtick, which disabled uploads for the rest of the segment
+        so a later image shipped as a raw path. The fence-aware span scan owns
+        the in-fence case; the inline-code check must not double-count it, so an
+        open code fence that carries no orphaned reference stays eligible.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # A long code fence, still open, over the limit -- no orphaned ref.
+        r._buf = ["```py\n" + "x = 1\n" * 40]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
+
+    @pytest.mark.asyncio
+    async def test_a_midline_cut_in_indented_code_degrades_uploads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A four-space indented logical line that is dirty-cut MID-LINE leaves
+        the tail continuing that literal-code context without its indent (GPT
+        security finding).
+
+        A reference arriving on the de-indented tail later would scan
+        markup-bearing alone, so the semantic seal would upload a source-literal
+        file the full text keeps literal. The per-chunk span scan cannot see it
+        (the ref has not arrived at rotation) and no backtick or escape debt is
+        present, so the rotation must fail closed on the indentation alone.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # One over-limit indented-code line, no ref yet; it is cut mid-line and
+        # the tail resumes the same logical line without the four-space indent.
+        r._buf = ["    " + "y" * 90 + "\n"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is False
+
+    @pytest.mark.asyncio
+    async def test_a_midline_cut_without_indent_keeps_uploads_eligible(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The indentation-debt rule fires only on a real four-space indent.
+
+        A non-indented logical line cut mid-line opens no literal-code context,
+        so a reference on its tail is genuinely real in the full text too and
+        extraction handles it correctly -- no literalness flip, no degrade.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        r._buf = ["z" * 90 + "\n"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
+
+    @pytest.mark.asyncio
+    async def test_a_midline_cut_before_a_tab_led_tail_degrades_uploads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A tab-led tail after a NON-indented source line is a real flip and
+        must degrade.
+
+        ``_safe_cut`` admits a mid-line boundary right before a leading ``\\t``
+        (a tab is not in ``_DELIM_LEAD``), so the retained tail BEGINS tab-led
+        and reads as indented code at offset 0 — while the source line's own
+        start is not indented. The classifications differ: the full text reads a
+        reference on that line as REAL, but the tail-alone reading the semantic
+        seal uses reads it LITERAL, so the seal drops the image and ships the raw
+        local path to Discord as display text. The rotation fails closed on the
+        indentation mismatch.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # Over-limit single logical line; the mid-line cut lands so the tail
+        # begins with a tab (>= four expanded columns) while the source line
+        # itself is not indented — a literalness flip in either reading.
+        r._buf = ["z" * 59 + "\t  more code on the same over-limit logical line\n"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is False
+
+    @pytest.mark.asyncio
+    async def test_an_over_limit_fenced_block_does_not_fake_seam_debt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fenced block crossing the limit must not disable uploads (Opus
+        finding).
+
+        The splitter builds ``tail = reopener + remainder`` with a synthetic
+        ``"```lang\\n"`` the source never had, so ``cut`` lands short of the real
+        seal — mid-line inside the last sealed code line. The head-side seam
+        checks (indentation, inline-code, escape) must be skipped when the tail
+        carries that reopener (``not split_source.endswith(tail)``): the seam is
+        inside an open fence, literal in both readings and owned by the
+        fence-aware per-chunk span scan. Otherwise the reopened fence's indent
+        faked indentation debt and disabled uploads for the whole segment.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # An indented fenced code block, over the limit, carrying no orphaned
+        # reference — every seam is inside the open fence.
+        r._buf = ["```py\n" + "    indented_code = 1\n" * 6]
         await r._rotate_on_length()
         assert r._segment_uploads_safe is True
 

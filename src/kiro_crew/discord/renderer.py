@@ -87,7 +87,11 @@ from kiro_crew.messaging.renderer import (
     session_provenance_tag,
     split_options_trailer,
 )
-from kiro_crew.messaging.split import split_markdown_safe, split_markdown_safe_with_tier
+from kiro_crew.messaging.split import (
+    iter_fence_spans,
+    split_markdown_safe,
+    split_markdown_safe_with_tier,
+)
 from kiro_crew.messaging.status_reactions import (
     PHASE_QUEUED,
     PHASE_THINKING,
@@ -234,6 +238,50 @@ def _transform_buries_refs(canonical: str, presented: str) -> bool:
     second one's path. Any drop is a loss.
     """
     return len(protected_ref_spans(presented)) < len(protected_ref_spans(canonical))
+
+
+#: Blank-line block boundary — the same divider the upload extraction model
+#: (:func:`outbound_files._literal_image_marker`) uses to bound an inline-code
+#: block. A lone paragraph break, not a general run of whitespace lines.
+_BLANK_LINE_RE = re.compile(r"\n[ \t]*\r?\n")
+
+
+def _inline_code_debt_at_cut(source_head: str) -> bool:
+    """True when *source_head* (the sealed prefix, ``split_source[:cut]``) ends
+    INSIDE an unclosed inline-code span, judged the way the extraction model
+    judges literalness.
+
+    A tail sealed after such a prefix reopens the same logical line without the
+    opener that made a ``![x](/p.png)`` on it literal, so the tail scans the ref
+    as real and the semantic seal attaches a file the full source kept literal.
+
+    The decision must match :func:`outbound_files._literal_image_marker` exactly
+    or it disagrees with the reader it is protecting. That model masks inline
+    code ONLY within the block that holds the offset — a block bounded by fenced
+    spans and blank lines — so a lone backtick in an earlier paragraph, or an
+    over-limit fenced block's own delimiter run, never reaches across a boundary
+    to cancel or fake an opener here. Masking the whole head instead (the
+    earlier spelling) diverged both ways: a cross-paragraph backtick cancelled a
+    real opener (a leak survived), and an open fence's run faked debt (uploads
+    disabled for the rest of the segment). Segment first, then mask the block
+    the cut lands in.
+    """
+    if not source_head:
+        return False
+    fenced = list(iter_fence_spans(source_head))
+    offset = len(source_head)
+    # A cut INSIDE a fenced span is fence debt, not inline-code debt: the fence
+    # already makes everything after the opener literal, and the fence-aware
+    # per-chunk span scan owns that case.
+    if any(start < offset <= end for start, end in fenced):
+        return False
+    boundaries = [*fenced, *(m.span() for m in _BLANK_LINE_RE.finditer(source_head))]
+    block_start = max((end for _s, end in boundaries if end <= offset), default=0)
+    # Mask inline code within the cut's own block, up to the cut. A surviving
+    # backtick means an inline-code run opened in this block and never closed
+    # before the boundary — exactly the debt the tail seal would misread.
+    masked_block = mask_inline_code(source_head[block_start:offset])
+    return "`" in masked_block
 
 
 def _as_subtext(text: str) -> str:
@@ -956,25 +1004,83 @@ class DiscordRenderer(Renderer):
                         degraded = True
                         break
                 if not degraded:
+                    # The remaining checks read the SEAL SEAM from the source:
+                    # ``cut`` is where the sealed prefix ends and the live tail
+                    # resumes. They are only meaningful when the tail is the
+                    # source's own remainder — ``split_source.endswith(tail)``.
+                    # When a fenced block crosses the limit the splitter builds
+                    # ``tail = reopener + remainder`` with a synthetic
+                    # ``"```lang\n"`` the source never had at that position, so
+                    # ``cut`` lands ``len(reopener)`` characters early, mid-line
+                    # inside the last sealed code line. That misread every
+                    # head-side check (a reopened fence's indent faked
+                    # indentation debt, its backticks faked inline-code debt, a
+                    # shifted offset faked escape debt) and disabled uploads for
+                    # the whole segment. A seam inside an open fence is literal
+                    # in BOTH readings anyway — the fence-aware per-chunk span
+                    # scan above already owns it — so skip the seam checks when
+                    # the tail carries a reopener.
                     cut = len(split_source) - len(tail)
-                    masked_head = await asyncio.to_thread(mask_inline_code, split_source[:cut])
-                    if "`" in masked_head:
+                    real_seam = split_source.endswith(tail)
+                    source_head = split_source[:cut]
+                    if real_seam and await asyncio.to_thread(_inline_code_debt_at_cut, source_head):
+                        # Delimiter (inline-code) debt: the sealed prefix ends
+                        # inside an unclosed inline-code run, so the live tail
+                        # reopens the same logical line without the opener that
+                        # made a reference on it literal. Judged per block, the
+                        # way the extraction model masks (fenced spans + blank
+                        # lines), so a backtick in an earlier paragraph cannot
+                        # reach across a boundary to cancel this opener and an
+                        # over-limit fenced run cannot fake debt here.
                         degraded = True
-                if not degraded:
-                    # Escape debt across the seal boundary: the sealed text
-                    # ends with an odd backslash run, so whatever the live
-                    # tail opens with is escaped in the full text. A tail that
-                    # scans markup-bearing alone -- e.g. a `[x](...)` whose
-                    # guarding `\` sealed away -- would then upload a
-                    # source-literal file at the semantic seal. The per-chunk
-                    # scans above cannot see this: the escape lives in a chunk
-                    # that never extracts. Fail closed. (The spans branch
-                    # above needs no equivalent: its boundary is a verified
-                    # unescaped `!`, so no escape can straddle it.)
-                    sealed_text = "".join(sealed)
-                    run = len(sealed_text) - len(sealed_text.rstrip("\\"))
+                if not degraded and real_seam:
+                    # Escape debt: the SOURCE head ends with an odd backslash
+                    # run, so whatever the live tail opens with is escaped in
+                    # the full text. A tail that scans markup-bearing alone --
+                    # e.g. a `[x](...)` whose guarding `\` sealed away -- would
+                    # upload a source-literal file at the semantic seal. Measure
+                    # the run on ``source_head`` (== ``split_source[:cut]``), NOT
+                    # the sealed chunk text: ``_seal`` rstrips its body, so a
+                    # boundary after ``\`` + whitespace (a markdown hard break,
+                    # or a backslash escaping a stripped trailing space) would
+                    # otherwise report debt no backslash actually straddles.
+                    # Fail closed. (The spans branch above needs no equivalent:
+                    # its boundary is a verified unescaped `!`.)
+                    run = len(source_head) - len(source_head.rstrip("\\"))
                     if run % 2 == 1:
                         degraded = True
+                if not degraded and real_seam:
+                    # Indentation debt. A four-space indented logical line is
+                    # literal code relative to its OWN line start. A MID-LINE
+                    # cut can make the sealed prefix and the retained tail
+                    # classify that same logical line DIFFERENTLY, and a
+                    # reference on the tail is judged at the semantic seal by the
+                    # tail's classification while the full text keeps the
+                    # source's — a flip in either direction is a leak:
+                    #   * head four-wide, tail not (the cut kept the indent on
+                    #     the sealed prefix and the tail resumes without it): the
+                    #     full text reads literal, the tail reads markup-bearing,
+                    #     so the seal uploads a source-literal file.
+                    #   * head not four-wide, tail four-wide (``_safe_cut`` admits
+                    #     a boundary before a leading ``\t`` — a tab is not in
+                    #     ``_DELIM_LEAD`` — so the tail BEGINS tab-led and reads
+                    #     as indented code at offset 0): the full text reads a
+                    #     real image, the tail reads it literal, so the seal
+                    #     drops it and ships the raw local path as display text.
+                    # Degrade whenever the two classifications differ; when they
+                    # AGREE there is no flip, and degrading would only cost a
+                    # genuinely-real image later in the segment. A clean
+                    # line-boundary cut needs no equivalent: ``split_markdown_safe``
+                    # never strips leading whitespace, so the tail keeps its own
+                    # indent and the per-chunk span scan already reads it right.
+                    if 0 < cut < len(split_source) and split_source[cut - 1] != "\n":
+                        line_start = split_source.rfind("\n", 0, cut) + 1
+                        head_indented = (
+                            split_source[line_start:cut].expandtabs(4).startswith("    ")
+                        )
+                        tail_indented = tail.expandtabs(4).startswith("    ")
+                        if head_indented != tail_indented:
+                            degraded = True
             if degraded:
                 self._segment_uploads_safe = False
         for ch in sealed:
