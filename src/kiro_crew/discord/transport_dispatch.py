@@ -81,7 +81,10 @@ from kiro_crew.messaging.dispatch import (
     consume_reinjection,
     delivery_is_muted,
     driver_turn_landed,
+    open_turn_crew_log,
+    predecessor_sid,
     rearm_reinjection,
+    requested_model_sid,
 )
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
@@ -831,6 +834,19 @@ class DiscordDispatcher:
                 logger.exception("Discord monitor session claim failed")
                 return MonitorDispatchResult.UNAVAILABLE
             _acquired = True
+            # Own session by construction (resumed keys were rejected above). Opened
+            # HERE, at the allocation and before any further await -- see the
+            # regular site below for why the moment matters. The predecessor is
+            # the allocation boundary's own capture, consumed after the claim.
+            open_turn_crew_log(
+                provider,
+                session_key=session_key,
+                agent=agent,
+                resumed=resumed,
+                ctx_builder=self.ctx_builder,
+                previous_sid=predecessor_sid(self.sessions, session_key),
+                model_requested=requested_model_sid(self.sessions, session_key),
+            )
         elif resumed_key is not None:
             # A resumed session must run as ITSELF, not as Discord's agent. On a
             # cold start get_or_create applies the agent we pass, so handing it
@@ -954,6 +970,36 @@ class DiscordDispatcher:
                     model=self._model_pref.get(scope_id) or None,
                 )
                 _acquired = True
+                if resumed_key is None or channel_namespace_of(session_key):
+                    # The session's crew log, opened the moment the allocation
+                    # lands and before ANY further await: the work ledger appends
+                    # every write to the acting session's log and rolls back one it
+                    # cannot record, so a DM admitted as a conductor needs its log
+                    # to exist before its first ledger call -- and a turn that bails
+                    # between the allocation and a later opener (a failed
+                    # attachment fetch, a renderer error) would leave a live session
+                    # whose log is first created on the NEXT turn, by then a warm
+                    # reuse, so the previous edge would never be written. The
+                    # predecessor is the allocation boundary's own capture, taken
+                    # inside its critical section and consumed here after the
+                    # claim -- no read of the mapping around the call, which a
+                    # concurrent turn's allocate-and-recycle could stale while this
+                    # turn waited inside the allocation. Every CHANNEL session this
+                    # dispatcher runs is opened here, including a same-DM native
+                    # history picked through ``!sessions`` (``resumed_key`` naming a
+                    # channel key): no dashboard runner ever handles its turns, so
+                    # this is its only opener. Only a resumed DASHBOARD session is
+                    # left alone -- its opener is the dashboard's, which alone holds
+                    # its lineage. Never raises, never suspends.
+                    open_turn_crew_log(
+                        provider,
+                        session_key=session_key,
+                        agent=agent,
+                        resumed=resumed,
+                        ctx_builder=self.ctx_builder,
+                        previous_sid=predecessor_sid(self.sessions, session_key),
+                        model_requested=requested_model_sid(self.sessions, session_key),
+                    )
             assert provider is not None
             renderer.authorize_upload_root(provider.cwd)
             # The turn footer's context chip reads usage off the session provider,
