@@ -177,10 +177,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
+import importlib.util
 import json
 import os
 import re
+import secrets
 import signal
+import sys
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -407,6 +411,7 @@ class IntegrationGateway:
     _client: ClientSession
     _boot_secs: float
     _tasks_before: frozenset["asyncio.Task[Any]"]
+    _cookie: str = ""
 
     @property
     def base_url(self) -> str:
@@ -452,13 +457,19 @@ class IntegrationGateway:
     ) -> Any:
         """One HTTP request against the live gateway. Returns the response.
 
-        ``auth=True`` (default) sends the boot token as ``?token=``; pass
-        ``auth=False`` to prove the 401/403 side of a contract.
+        ``auth=True`` (default) sends the dashboard session cookie ``_boot``
+        minted from the boot token; pass ``auth=False`` to prove the 401/403
+        side of a contract. The cookie, not ``?token=``: the link token is a
+        one-use nonce that the ``mixed_internal`` routes (``/api/chat/slots``
+        among them) refuse once any ordinary route has minted the cookie, and
+        aiohttp's jar does not keep cookies set by an IP host, so the harness
+        carries it as a header the way the E2E ``_Client`` carries its jar.
         """
         url = f"{self.base_url}{path}"
         params = dict(kwargs.pop("params", {}) or {})
+        headers = dict(headers or {})
         if auth:
-            params["token"] = self.token
+            headers["Cookie"] = self._cookie
         self._note_hit(method.upper(), path.split("?", 1)[0])
         return await self._client.request(
             method,
@@ -484,6 +495,26 @@ class IntegrationGateway:
 
     async def delete(self, path: str, **kw: Any) -> Any:
         return await self.request("DELETE", path, **kw)
+
+    def mcp_headers(self, session_key: str) -> dict[str, str]:
+        """The headers a managed MCP server sends on the session's behalf.
+
+        The launcher's half of the session-token handshake, done in-process:
+        mint a token, publish its signed ``token -> session_key`` record the way
+        ``session/new`` does, and hand back the three headers the internal
+        routes authenticate on (``X-Internal-Secret`` proves the loopback
+        process, ``X-Session-Token`` attests the ``X-Session-Key``). Use with
+        ``auth=False``: these routes are for processes, not the dashboard user.
+        """
+        from kiro_crew.session_token_sig import publish_session_token
+
+        token = secrets.token_hex(16)
+        publish_session_token(token, session_key)
+        return {
+            "X-Internal-Secret": self.app["local_secret"],
+            "X-Session-Key": session_key,
+            "X-Session-Token": token,
+        }
 
     async def get_json(self, path: str, *, expect: int = 200, **kw: Any) -> Any:
         resp = await self.get(path, **kw)
@@ -525,6 +556,7 @@ class IntegrationGateway:
         self.token = fresh.token
         self._run_task = fresh._run_task
         self._client = fresh._client
+        self._cookie = fresh._cookie
         self._tasks_before = fresh._tasks_before
         return self
 
@@ -817,6 +849,22 @@ async def _boot(home: Path, *, boot_secs: float) -> IntegrationGateway:
     )
     if handle.app is not None:
         _record_registered_routes(handle.app)
+    try:
+        async with client.get(
+            f"{handle.base_url}/api/status",
+            params={"token": handle.token},
+            timeout=ClientTimeout(total=10),
+        ) as resp:
+            set_cookie = resp.headers.get("Set-Cookie", "")
+            if resp.status != 200 or not set_cookie.startswith("mc_token_"):
+                raise RuntimeError(
+                    f"boot token did not mint a session cookie: {resp.status} {set_cookie[:60]!r}"
+                )
+            handle._cookie = set_cookie.split(";", 1)[0]
+    except BaseException:
+        await client.close()
+        await _teardown_boot(orchestrator, run_task, tasks_before)
+        raise
     return handle
 
 
@@ -864,6 +912,32 @@ async def booted_gateway(
                 _put_back()
 
 
+@functools.cache
+def _rootdir_agent_spec_hooks() -> tuple[tuple[str, str], ...]:
+    """The rootdir conftest's ``_AGENT_SPEC_HOOKS``, read from the one definition.
+
+    ``integration_home`` releases exactly the hooks that conftest pins, so the
+    list is read from it rather than copied: a sixth hook added upstream would
+    otherwise stay pinned here and silently reopen the write/read split. Loaded
+    by path the way ``test_host_isolation_floor.py`` does -- the plugin name
+    pytest registers a conftest under is not stable -- and its fixtures are
+    inert under this module name (a decorator only marks a function).
+
+    Cached: executing that module runs its import-time work (the data-home
+    floor, an ``atexit`` hook, environment scrubs), which pytest has already
+    done once for the real plugin. The re-exec happens ONCE per worker process,
+    on the first boot, never per test.
+    """
+    root_conftest = Path(__file__).resolve().parents[2] / "conftest.py"
+    spec = importlib.util.spec_from_file_location("_kirocrew_rootdir_conftest", root_conftest)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    hooks = module._AGENT_SPEC_HOOKS
+    assert hooks, "the rootdir conftest no longer defines _AGENT_SPEC_HOOKS"
+    return tuple(hooks)
+
+
 @pytest.fixture
 def integration_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A fresh, isolated ``KIROCREW_HOME`` with the fake model wired in.
@@ -878,6 +952,18 @@ def integration_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # Isolate the agent-spec home too: boot rewrites managed MCP specs under
     # ``kiro_agents_dir()``, which must never be the operator's ``~/.kiro/agents``.
     monkeypatch.setenv("KIRO_HOME", str(home / "kiro"))
+    # The rootdir conftest pins the WRITE side of the agent-spec seam (the
+    # ``KIRO_AGENTS_DIR`` hooks) to its own per-test directory while the READ
+    # side (``config.paths.kiro_agents_dir``) follows ``KIRO_HOME``. Under that
+    # pin the boot writes ``kirocrew.json`` where no request will read it. This
+    # layer exists to hold both sides of a seam, so both resolve through
+    # ``KIRO_HOME`` here -- to ``<home>/kiro/agents``, which is exactly the
+    # private target ``agent._decline_shared_agent_home`` exempts.
+    for module_name, attr in _rootdir_agent_spec_hooks():
+        module = sys.modules.get(module_name)
+        if module is not None:
+            monkeypatch.setattr(module, attr, None, raising=False)
+    monkeypatch.setattr("kiro_crew.config.paths._agents_dir_override", None, raising=False)
     monkeypatch.setenv("KIROCREW_KIRO_BIN", str(fake_acp_backend.__file__))
     monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
     # Strict on-loop persistence, set HERE rather than in the CI job's env: the

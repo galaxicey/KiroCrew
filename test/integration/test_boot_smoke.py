@@ -213,6 +213,10 @@ _KNOWN_SECOND_BOOT_CHANGES: dict[tuple[str, str], str] = {
     ("kiro_crew.dashboard.handlers.mcp", "_mcp_probe_ts"): "keyed cache",
     ("kiro_crew.mcp_discovery", "_probe_cache"): "keyed cache",
     ("kiro_crew.agent_discovery", "_PARSED_SPECS_CACHE"): "keyed cache",
+    ("kiro_crew.sandbox", "_SHIM_ARGV_CACHE"): "keyed cache",
+    # Warn-once flags and one-shot probes: set on first use, never read as state.
+    ("kiro_crew.browser_cli.launch", "_warned_lifecycle_losses"): "warn-once set",
+    ("kiro_crew.sandbox", "_SLICE_THROTTLE_PROBE_SEEN"): "one-shot probe result",
     # Process-wide thread pools created on first use, home-independent.
     ("kiro_crew.executors", "_pool"): "lazy thread pool",
     ("kiro_crew.executors", "_subprocess_pool"): "lazy thread pool",
