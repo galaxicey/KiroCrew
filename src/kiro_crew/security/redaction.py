@@ -892,6 +892,95 @@ def _text_contains_bare_secret(text: str) -> bool:
     return any(_contains_bare_secret(match.group()) for match in _BARE_SECRET_RUN_RE.finditer(text))
 
 
+#: Characters in one ascending run of consecutive code points before that run
+#: counts as part of an enumerated table. Six is below the shortest enumerated
+#: block a container writer emits and far above the longest ascending fragment
+#: that occurs inside generated credential material.
+_ENUMERATED_RUN_MIN = 6
+
+#: Adjacent runs that make a region an enumerated TABLE rather than one ordered
+#: fragment. Three is what separates a symbol table -- successive blocks of
+#: consecutive values, written back to back -- from a single ordered span such as
+#: the ``12345678`` inside an account identifier, which must stay visible to the
+#: detectors.
+_ENUMERATED_TABLE_MIN_RUNS = 3
+
+#: Substituted for every character of a masked table. NUL is in no credential
+#: character class in :data:`_CREDENTIAL_PATTERNS`, in ``_B64_CHUNK_RE`` and in
+#: ``_BARE_SECRET_RUN_RE``, so masking can only remove a match, never create one.
+#: The label-anchored value classes that do admit NUL still need their literal
+#: label, which is not an ascending run and so is never masked.
+_ENUMERATED_TABLE_FILLER = "\x00"
+
+
+def _ascending_runs(text: str) -> list[tuple[int, int]]:
+    """Maximal spans of *text* whose code points ascend by exactly one."""
+    runs: list[tuple[int, int]] = []
+    start = 0
+    for index in range(1, len(text) + 1):
+        if index == len(text) or ord(text[index]) != ord(text[index - 1]) + 1:
+            runs.append((start, index))
+            start = index
+    return runs
+
+
+def mask_enumerated_byte_tables(text: str) -> str:
+    """Blank the enumerated symbol tables in *text*, leaving everything else.
+
+    For the BINARY delivery scans only. A binary container carries fixed symbol
+    tables -- a JPEG ``DHT`` segment's Huffman values, an ICC tag list, a palette
+    -- and those tables are written as successive blocks of consecutive byte
+    values. Decoded as ``latin-1`` such a block reads as printable ASCII in strict
+    ascending order, and that satisfies a credential pattern whose shape carries
+    no label to anchor on: the standard baseline Huffman table spells
+    ``456789:CDEFGHIJ...``, which is six digits, a colon and thirty-two letters,
+    exactly the bot-token shape. Every JPEG written with the default tables holds
+    it, including a blank 694-byte one with no metadata at all.
+
+    The detectors cannot see this on their own. Their entropy floor scores the
+    character multiset, and an ascending block has MAXIMAL symbol diversity -- the
+    32-character run above scores the full 5.0 bits per character -- so the one
+    property that gives it away is sequential predictability, which nothing in the
+    catalogue measures. A credential is unpredictable by construction; a table is
+    fully determined by its first byte.
+
+    Masking cannot hide credential material. A region is masked only when it is
+    built from :data:`_ENUMERATED_TABLE_MIN_RUNS` or more ADJACENT runs of at
+    least :data:`_ENUMERATED_RUN_MIN` consecutive code points. A credential's own
+    characters do not ascend, so they form runs far below that floor, which breaks
+    adjacency and ends the region -- padding a real key with tables on both sides
+    leaves the key itself standing. One long ordered fragment is not enough either,
+    so an identifier holding ``12345678`` keeps its whole match.
+
+    The TEXT path deliberately keeps the unmasked scan. There a match costs a
+    redaction tag; here it costs the delivery of the file, and the only way past
+    that refusal is the durable class-wide grant in
+    :mod:`kiro_crew.file_delivery_consent`, which then disarms the refusal for
+    every content kind on every owner-facing gate. Noise on this path spends the
+    control, so this path is where the noise has to go.
+    """
+    runs = [
+        (start, end) for start, end in _ascending_runs(text) if end - start >= _ENUMERATED_RUN_MIN
+    ]
+    if len(runs) < _ENUMERATED_TABLE_MIN_RUNS:
+        return text
+    spans: list[tuple[int, int]] = []
+    first = 0
+    while first < len(runs):
+        last = first
+        while last + 1 < len(runs) and runs[last + 1][0] == runs[last][1]:
+            last += 1
+        if last - first + 1 >= _ENUMERATED_TABLE_MIN_RUNS:
+            spans.append((runs[first][0], runs[last][1]))
+        first = last + 1
+    if not spans:
+        return text
+    masked = list(text)
+    for start, end in spans:
+        masked[start:end] = _ENUMERATED_TABLE_FILLER * (end - start)
+    return "".join(masked)
+
+
 # Standard replacement tag for a redacted credential. Shared between the batch
 # redactor (`redact_credentials`) and the streaming fail-closed path
 # (`StreamRedactor.feed`) so the on-the-wire marker is identical everywhere.

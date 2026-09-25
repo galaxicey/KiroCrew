@@ -901,6 +901,24 @@ _WIDE_PROJECTIONS: Tuple[Tuple["re.Pattern[bytes]", int, int], ...] = (
 )
 
 
+def _enumerated_tables_masked(raw_text: str) -> str:
+    """*raw_text* with its enumerated symbol tables blanked, for a binary scan.
+
+    Deferred import for the reason :func:`redact_via_context` states: keep the
+    redaction regex stack off the platform module-load path. Only the two binary
+    scans below reach here, and a gate that is already scanning content pays that
+    import willingly.
+
+    Degrades to the unmasked text if the helper cannot be imported, so a broken
+    import weakens no refusal: the scan then answers exactly as it did before.
+    """
+    try:
+        from kiro_crew.security.redaction import mask_enumerated_byte_tables
+    except Exception:
+        return raw_text
+    return mask_enumerated_byte_tables(raw_text)
+
+
 def wide_content_is_flagged(raw: bytes) -> bool:
     """Whether *raw* carries credential material written at UTF-16/UTF-32 spacing.
 
@@ -919,6 +937,12 @@ def wide_content_is_flagged(raw: bytes) -> bool:
     also what keeps the detectors from being handed a second stream of
     high-entropy bytes, which would widen the false-positive surface.
 
+    The lifted characters go through the same enumerated-table mask the narrow
+    binary pass uses. A container's symbol table can be written at wide spacing
+    too, and lifting it by stride reproduces the ascending run that satisfies an
+    unlabelled credential shape, so masking only one of the two passes would leave
+    the same clean media refused on the other.
+
     Synchronous, like :func:`binary_content_is_flagged`: an async gate calls it
     through ``asyncio.to_thread`` rather than on the event loop.
     """
@@ -929,7 +953,7 @@ def wide_content_is_flagged(raw: bytes) -> bool:
     ]
     if not lifted:
         return False
-    wide = b"\n".join(lifted).decode("latin-1")
+    wide = _enumerated_tables_masked(b"\n".join(lifted).decode("latin-1"))
     return redact_via_context(wide) != wide
 
 
@@ -968,11 +992,19 @@ def binary_content_is_flagged(raw: bytes) -> bool:
     the owner-facing three honour the owner's recorded grant, the upload legs
     refuse unconditionally.
 
+    The enumerated symbol tables a container carries are masked before the scan,
+    for the reason ``mask_enumerated_byte_tables`` documents: those tables read as
+    strictly ascending printable ASCII, which satisfies an unlabelled credential
+    shape, so without the mask essentially every JPEG written with the default
+    Huffman tables is refused here. The mask is applied to the scanned COPY and
+    only to regions built from several adjacent ascending runs, so no credential
+    material is hidden from any detector.
+
     Synchronous, and deliberately: the scan is CPU work over up to the 50 MB read
     cap, so an async gate must call it through ``asyncio.to_thread`` rather than
     on the event loop.
     """
-    text = raw.decode("latin-1")
+    text = _enumerated_tables_masked(raw.decode("latin-1"))
     if redact_via_context(text) != text:
         return True
     return wide_content_is_flagged(raw)

@@ -159,12 +159,15 @@ class TestOutboxNotifyBinary:
         mp3 = outbox / "test.mp3"
         mp3.write_bytes(b"\xff\xfb\x90\x00" + b"\x00" * 50)
         async with TestClient(TestServer(_make_app())) as client:
-            resp = await client.post("/api/outbox/notify", json={
-                "path": str(mp3),
-                "filename": "test.mp3",
-                "description": "test audio",
-                "size": mp3.stat().st_size,
-            })
+            resp = await client.post(
+                "/api/outbox/notify",
+                json={
+                    "path": str(mp3),
+                    "filename": "test.mp3",
+                    "description": "test audio",
+                    "size": mp3.stat().st_size,
+                },
+            )
             assert resp.status == 200
             data = await resp.json()
             assert data["ok"] is True
@@ -175,12 +178,15 @@ class TestOutboxNotifyBinary:
         exe = outbox / "payload.exe"
         exe.write_bytes(b"\x4d\x5a\x90\x00\x03\x00\xff\xfe\x80\x81" * 10)  # non-UTF-8 PE header
         async with TestClient(TestServer(_make_app())) as client:
-            resp = await client.post("/api/outbox/notify", json={
-                "path": str(exe),
-                "filename": "payload.exe",
-                "description": "bad file",
-                "size": exe.stat().st_size,
-            })
+            resp = await client.post(
+                "/api/outbox/notify",
+                json={
+                    "path": str(exe),
+                    "filename": "payload.exe",
+                    "description": "bad file",
+                    "size": exe.stat().st_size,
+                },
+            )
             assert resp.status == 400
             data = await resp.json()
             assert "not allowed" in data["error"]
@@ -191,12 +197,15 @@ class TestOutboxNotifyBinary:
         txt = outbox / "secrets.txt"
         txt.write_text("key=AKIAIOSFODNN7EXAMPLE")
         async with TestClient(TestServer(_make_app())) as client:
-            resp = await client.post("/api/outbox/notify", json={
-                "path": str(txt),
-                "filename": "secrets.txt",
-                "description": "oops",
-                "size": txt.stat().st_size,
-            })
+            resp = await client.post(
+                "/api/outbox/notify",
+                json={
+                    "path": str(txt),
+                    "filename": "secrets.txt",
+                    "description": "oops",
+                    "size": txt.stat().st_size,
+                },
+            )
             assert resp.status == 400
             data = await resp.json()
             assert "sensitive" in data["error"]
@@ -234,8 +243,11 @@ class TestOutboxDownloadBinary:
             assert "not allowed" in data["error"]
         expected_mime = mimetypes.guess_type("bad.exe")[0] or "application/octet-stream"
         mock_sel.log_tool_invocation.assert_called_with(
-            session_key="api", source="api", tool_name="file_send",
-            tool_kind="download", outcome="denied",
+            session_key="api",
+            source="api",
+            tool_name="file_send",
+            tool_kind="download",
+            outcome="denied",
             error=f"binary_mime_not_allowed: {expected_mime}",
         )
 
@@ -484,3 +496,196 @@ class TestWideEncodedCredentialInAUtf8DecodableFile:
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.get("/api/outbox/report.pdf")
             assert resp.status == 400
+
+
+#: Byte blocks of the standard baseline JPEG Huffman symbol table, each a run of
+#: consecutive values, written back to back exactly as the default tables carry
+#: them. Assembled from its structure rather than pasted, so the test states what
+#: makes these bytes a table instead of asserting against an opaque literal.
+_JPEG_HUFFMAN_BLOCKS: tuple[tuple[int, int], ...] = (
+    (0x25, 0x2A),
+    (0x34, 0x3A),
+    (0x43, 0x4A),
+    (0x53, 0x5A),
+    (0x63, 0x6A),
+    (0x73, 0x7A),
+)
+
+
+def _enumerated_table() -> bytes:
+    """The container symbol table, as successive runs of consecutive values."""
+    return b"".join(bytes(range(low, high + 1)) for low, high in _JPEG_HUFFMAN_BLOCKS)
+
+
+def _clean_jpeg() -> bytes:
+    """JPEG-shaped bytes carrying the standard table and nothing sensitive.
+
+    ``\\xff\\xd8\\xff\\xe0`` is the SOI/APP0 head a JPEG opens with and puts the
+    guessed MIME type inside the allow-list; ``\\xff\\xdb`` opens the table
+    segment. The high bytes at the end are what makes the UTF-8 decode raise, so
+    these bytes take each gate's binary branch.
+    """
+    return (
+        b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\xff\xdb\x00C" + _enumerated_table() + b"\x80\x81\xff\xd9"
+    )
+
+
+def _telegram_shaped_token(bot_id: str) -> str:
+    """A bot-token-SHAPED value, assembled at runtime.
+
+    Same convention as :func:`_synth_flagged_png`: the scanner sees identical
+    bytes either way, and a diff carrying a literal token reads as key material
+    to a review provider. The body is deterministic base64 over a digest, so it
+    is token-SHAPED without being a token.
+    """
+    body = base64.urlsafe_b64encode(hashlib.sha256(bot_id.encode()).digest()).decode().rstrip("=")
+    return f"{bot_id}:{body[:35]}"
+
+
+class TestContainerSymbolTablesAreNotCredentials:
+    """A container's own symbol table must not spend the owner's delivery grant.
+
+    A binary container writes its fixed tables as successive blocks of
+    consecutive byte values. Read as ``latin-1`` such a block is printable ASCII
+    in strict ascending order, and the standard baseline Huffman table spells six
+    digits, a colon and thirty-two letters -- the shape of an unlabelled bot
+    token. The detectors' entropy floor scores the character multiset, and an
+    ascending block has maximal symbol diversity, so nothing in the catalogue
+    measures the one property that gives a table away.
+
+    The cost is not the refusal. The three owner-facing gates read one durable
+    grant, so the owner's only way past a refused photo is to record a grant that
+    is class-wide: once recorded it disarms the refusal for every content kind on
+    all three gates, and a genuine key afterwards leaves with an audit entry and
+    no refusal. Noise on this path spends the control, which is why a table has to
+    be invisible to the scan rather than merely rare.
+
+    The first test is the control that keeps the rest honest: it asserts the table
+    really does satisfy a credential shape on an unmasked scan, so a scanner that
+    dropped the mask fails the tests below rather than passing them trivially.
+    """
+
+    def test_the_table_really_does_satisfy_a_credential_shape(self):
+        from kiro_crew import security
+
+        table = _enumerated_table().decode("latin-1")
+        assert security.redact(table) != table
+
+    def test_a_container_carrying_only_its_table_is_not_flagged(self):
+        from kiro_crew.platform import binary_content_is_flagged
+
+        raw = _clean_jpeg()
+        with pytest.raises(UnicodeDecodeError):
+            raw.decode("utf-8")
+        assert not binary_content_is_flagged(raw)
+
+    @pytest.mark.parametrize(
+        "secret",
+        [
+            _telegram_shaped_token("110201543"),
+            "AKIA" + "IOSFODNN7EXAMPLE",
+            "gh" + "p_" + hashlib.sha256(b"kc-gate").hexdigest()[:36],
+        ],
+        ids=["bot-token", "access-key-id", "forge-token"],
+    )
+    def test_a_credential_inside_the_same_container_is_still_flagged(self, secret):
+        from kiro_crew.platform import binary_content_is_flagged
+
+        assert binary_content_is_flagged(_clean_jpeg() + secret.encode())
+
+    def test_a_key_inside_the_same_container_is_still_flagged(self):
+        from kiro_crew.platform import binary_content_is_flagged
+
+        assert binary_content_is_flagged(_clean_jpeg() + _pem_text().encode())
+
+    def test_tables_on_both_sides_of_a_credential_do_not_hide_it(self):
+        """A credential's own characters do not ascend, so a table cannot reach it.
+
+        The masked region ends where the ascending runs end. Padding is therefore
+        not a bypass: it is the one case an attacker would reach for, and the
+        credential between the two tables keeps its match.
+        """
+        from kiro_crew.platform import binary_content_is_flagged
+
+        table = _enumerated_table()
+        secret = _telegram_shaped_token("110201543").encode()
+        assert binary_content_is_flagged(b"\xff\xd8\xff\xe0" + table + secret + table + b"\x80")
+
+    def test_one_long_ordered_fragment_keeps_its_whole_match(self):
+        """An ordered span inside an identifier is not a table, so nothing is masked.
+
+        A bot id can be ascending on its own. One run is not an enumerated table,
+        and the value must stay visible to the detectors.
+        """
+        from kiro_crew.platform import binary_content_is_flagged
+
+        secret = _telegram_shaped_token("123456789")
+        assert secret.startswith("123456789:")
+        assert binary_content_is_flagged(b"\xff\xd8\xff\xe0\x80\x81" + secret.encode())
+
+    def test_short_ascending_pairs_inside_a_value_are_not_a_table(self):
+        """The run floor is what stops character coincidence from masking a value.
+
+        Adjacent ascending PAIRS are ordinary coincidence in any long value, so a
+        floor low enough to admit them turns a credential body into one masked
+        region and loses the match. The body below is pairs end to end, which is
+        the worst case that coincidence can reach, and the first assertion is what
+        makes it that case rather than an opaque string.
+        """
+        from kiro_crew.platform import binary_content_is_flagged
+        from kiro_crew.security.redaction import _ascending_runs
+
+        paired = "abdeghjkmnpqstvwyzABDEGHJKMNPQ"
+        assert {end - start for start, end in _ascending_runs(paired)} == {2}
+        secret = f"110201543:{paired}"
+        assert binary_content_is_flagged(b"\xff\xd8\xff\xe0\x80\x81" + secret.encode())
+
+    def test_masking_leaves_every_byte_outside_a_table_alone(self):
+        from kiro_crew.security.redaction import mask_enumerated_byte_tables
+
+        table = _enumerated_table().decode("latin-1")
+        head, tail = "the quick brown fox", "jumps over the lazy dog"
+        masked = mask_enumerated_byte_tables(head + table + tail)
+        assert masked.startswith(head)
+        assert masked.endswith(tail)
+        assert masked[len(head) : len(masked) - len(tail)] == "\x00" * len(table)
+
+    @pytest.mark.parametrize("encoding", _WIDE_ENCODINGS)
+    def test_the_wide_pass_masks_the_table_too(self, encoding):
+        """A table written at wide spacing lifts back to the same ascending run."""
+        from kiro_crew.platform import wide_content_is_flagged
+
+        table = _enumerated_table().decode("latin-1")
+        assert not wide_content_is_flagged(b"%PDF-1.7\n" + table.encode(encoding) + b"\n%%EOF\n")
+
+    @pytest.mark.parametrize("encoding", _WIDE_ENCODINGS)
+    def test_the_wide_pass_still_answers_on_a_key_beside_a_table(self, encoding):
+        from kiro_crew.platform import wide_content_is_flagged
+
+        payload = _enumerated_table().decode("latin-1") + _pem_text()
+        assert wide_content_is_flagged(b"%PDF-1.7\n" + payload.encode(encoding) + b"\n%%EOF\n")
+
+    @pytest.mark.asyncio
+    async def test_notify_delivers_a_container_carrying_only_its_table(self, outbox, mock_sel):
+        """The owner is never sent to the grant panel for a clean container."""
+        jpeg = outbox / "photo.jpg"
+        jpeg.write_bytes(_clean_jpeg())
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.post(
+                "/api/outbox/notify",
+                json={
+                    "path": str(jpeg),
+                    "filename": "photo.jpg",
+                    "description": "photo",
+                    "size": jpeg.stat().st_size,
+                },
+            )
+            assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_download_serves_a_container_carrying_only_its_table(self, outbox, mock_sel):
+        jpeg = outbox / "photo.jpg"
+        jpeg.write_bytes(_clean_jpeg())
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get("/api/outbox/photo.jpg")
+            assert resp.status == 200
