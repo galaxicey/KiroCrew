@@ -259,11 +259,19 @@ def _ast_findings(content: str) -> List[str]:
         | _DESCRIPTOR_METHODS
         | {"__globals__"}
     )
+    # ``case C(f)`` binds ``f`` from ``C.__match_args__`` (or the subject
+    # itself for a self-matching builtin), read at run time. Neither the class
+    # nor a builtin name can be trusted statically: a script can rebind either
+    # through ``globals()``, ``setattr`` or ``__builtins__``. So every positional
+    # class pattern fails closed; keyword patterns stay allowed under the
+    # ``kwd_attrs`` check in the same loop.
     for node in ast.walk(tree):
         if isinstance(node, ast.MatchClass):
             for attr in node.kwd_attrs:
                 if attr in _match_denied:
                     findings.append(f"attribute read in a match pattern: {attr}=")
+            if node.patterns:
+                findings.append(f"positional match pattern: {ast.unparse(node.cls)}(...)")
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
