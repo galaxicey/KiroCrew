@@ -55,13 +55,13 @@ def _agent(**kw) -> KiroCrewAgentConfig:
 
 
 def _config_files_for_fingerprint(tmp_path, monkeypatch):
-    """Point the loader's config fingerprint at files this test owns.
+    """Point the config fingerprint at files this test owns.
 
     ``_config_fingerprint`` reads ``config_path()`` / ``config_local_path()`` from
     ``kiro_crew.config.loader``, which is the pair the test suite patches. Returns
     the base file so a test can rewrite it to stand for a save landing on disk; the
-    local overlay is deliberately left absent (the fingerprint carries a sentinel
-    for a missing file, so its absence is stable rather than unstated).
+    local overlay is deliberately left absent, since the fingerprint carries a
+    sentinel for a missing file and its absence is therefore stable.
     """
     base = tmp_path / "config.json"
     base.write_text("{}", encoding="utf-8")
@@ -346,10 +346,11 @@ class TestApiMembersProjections:
         svc = get_service()
         assert svc.snapshot(slug)["values"][types.PROJ_ROSTER]["model"] == "claude-x"
 
-        # The save lands mid-request: `config.json` is rewritten and the save's own
-        # member/config is appended, both AFTER the next request's config load.
-        # Driven from `snapshot` because that is the row-loop step the window ends
-        # at, and once only, so the reconcile's own re-snapshot cannot re-fire it.
+        # The save lands mid-request: `config.json` is rewritten, the live config now
+        # answers with the saved model, and the save's own member/config is appended
+        # -- all AFTER the next request's config load. Driven from `snapshot` because
+        # that is the row-loop step the window ends at, and once only, so the
+        # reconcile's own re-snapshot cannot re-fire it.
         real_snapshot = svc.snapshot
         fired: list[bool] = []
 
@@ -378,8 +379,12 @@ class TestApiMembersProjections:
 # 3. reconcile_members_at_startup: synthesize interrupted closers, once
 # ---------------------------------------------------------------------------
 class TestStartupReconcile:
-    def test_writes_one_closer_each_then_nothing_on_rerun(self):
+    def test_writes_one_closer_each_then_nothing_on_rerun(self, monkeypatch):
         cfg = _fake_config({CREW: _agent()})
+        # The sweep performs its OWN paired config read for the config-reconcile
+        # step, so the fixture config has to be what that read returns or every
+        # correction below is skipped and the sweep proves nothing.
+        monkeypatch.setattr("kiro_crew.config.loader.KiroCrewConfig.load", lambda: cfg)
         slug = members.slug_for_name(CREW)
         svc = get_service()
         svc.ensure(slug, CREW)
@@ -418,7 +423,7 @@ class TestStartupReconcile:
         assert eventlog_hooks.reconcile_members_at_startup(cfg, state, autonudge) == 0
         assert svc.last_seq(slug) == seq_after
 
-    def test_an_explicit_member_id_decides_which_log_is_reconciled(self):
+    def test_an_explicit_member_id_decides_which_log_is_reconciled(self, monkeypatch):
         """Reconcile by persisted identity, not by folding the display name.
 
         A member carrying an explicit ``member_id`` owns the log at that id. A
@@ -433,6 +438,10 @@ class TestStartupReconcile:
         assert folded != member_id, "fixture must distinguish the two identities"
 
         cfg = _fake_config({name: _agent(member_id=member_id)}, default=name)
+        # As above: the sweep reconciles config against its own paired read, and
+        # that correction is the sweep's only append here, so the fixture config
+        # has to be what that read returns.
+        monkeypatch.setattr("kiro_crew.config.loader.KiroCrewConfig.load", lambda: cfg)
         svc = get_service()
         svc.ensure(member_id, name)
         before = svc.last_seq(member_id)

@@ -241,17 +241,18 @@ def _slot_has_unflushed_rows(slot: object) -> bool:
 
 
 def _load_config_with_fingerprint() -> tuple[tuple, KiroCrewConfig]:
-    """The roster's config load, stamped with the files it was read from.
+    """The roster's config load, paired with a stamp of the files it read.
 
-    The stamp goes with the config into ``reconcile_member_config``, which is
-    what binds a correction to the config it was computed from. It is taken
-    BEFORE the read rather than after: a stamp taken afterwards could certify a
-    config that had already been replaced while the read was in flight. Stale in
-    the refusing direction only skips a correction the next roster read makes
-    again; stale in the accepting direction is the regression the stamp exists to
-    prevent.
+    The stamp travels with the config into ``reconcile_member_config``, which is
+    what lets a correction computed here be refused if the files move before it
+    lands. It is taken BEFORE the read, not after: a stamp taken afterwards could
+    certify a config that had already been replaced while the read was in flight.
+    Stale in the refusing direction only skips a correction the next roster read
+    makes again; stale in the accepting direction is the regression the stamp
+    exists to prevent.
 
-    One thread hop for both, so the stat pass does not land on the event loop.
+    One thread hop for both, so neither the stat pass nor the load lands on the
+    event loop, and the roster still loads the config exactly once.
     """
     from kiro_crew.config.loader import _config_fingerprint
 
@@ -564,10 +565,10 @@ async def api_members(request: web.Request) -> web.Response:
                             row["name"],
                             agent_cfg,
                             values.get("roster", {}),
-                            # The stamp of the config `agent_cfg` came from. This
-                            # read loads the config ONCE and projects every row
+                            # The stamp paired with the load `agent_cfg` came from.
+                            # This read loads the config ONCE and projects every row
                             # from it, so a save landing after that load leaves the
-                            # fold newer than what is held here; the stamp is what
+                            # fold newer than the values held here; the stamp is what
                             # lets the append refuse rather than regress it.
                             config_fingerprint=config_fingerprint,
                         )

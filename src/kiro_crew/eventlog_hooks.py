@@ -268,37 +268,53 @@ def _config_snapshot_for_agent(agent_cfg) -> dict:
     return out
 
 
-def _config_is_still_live_at(fingerprint, values: dict, observed: dict) -> bool:
-    """Is the config this correction was computed from still the live config?
+#: Key under which the config reconcile's ``observed`` carries the stamp of the
+#: config files its correction was read from. Not a projection key: what that
+#: correction has to be re-checked against is the CONFIG, and no projection holds
+#: one.
+_OBSERVED_CONFIG_FINGERPRINT = "config_fingerprint"
+
+
+def _config_is_still_live_at(values: dict, observed: dict) -> bool:
+    """Are the config files this correction was read from still unchanged?
 
     Module level so the reconcile and its tests share ONE definition; a copy in
     the test would pin the copy and let production drift away from it.
 
-    The correction is computed from a config the CALLER loaded and is written
+    The correction is computed from a config the caller loaded and is written
     afterwards. Between the two a save can land: it writes the config files and
     then appends its own ``member/config``, so the fold ends up NEWER than the
-    config still in hand. The roster fold is last-wins per field, so appending
-    the older values regresses it durably -- an append-only log with no
-    compaction has nothing to reopen it until the next read.
+    config the caller is still holding. The roster fold is last-wins per field,
+    so appending the older values regresses it durably -- an append-only log with
+    no compaction has nothing to reopen it until the next read.
 
-    The projection cannot answer this, which is why this predicate reads neither
-    argument. By the time the two are compared the fold ALREADY shows the saved
-    value -- that difference is exactly what the comparison found -- so asking
-    whether the fold moved since then sees no change and lets the regression
-    through. The question belongs on the config side: the correction is valid
-    only while the files it was read from are unchanged.
+    The projection cannot answer this, which is why *values* goes unread. By the
+    time the comparison is made the fold ALREADY shows the saved value -- that
+    difference is exactly what the comparison found -- so asking whether the fold
+    moved since then sees no change and lets the regression through. The question
+    belongs on the config side: the correction is valid only while the files it
+    was read from are unchanged.
 
-    ``_config_fingerprint`` covers both config files as a pair, not one member,
-    so an edit to any member refuses this one's correction too. That is the safe
-    direction: a refusal skips one correction and the next roster read compares
-    afresh, while a wrong acceptance is permanent.
+    The stamp must be PAIRED with the read it describes -- taken just before it,
+    by whoever performed it. A stamp taken later, where the append happens, can
+    certify files that were already replaced when the values were read, which is
+    the accepting direction and precisely the regression. Taken just before, the
+    error goes the other way: a replacement mid-read refuses a correction the
+    next read makes again.
+
+    ``_config_fingerprint`` covers both config files as a pair rather than one
+    member, so an edit to any member refuses this one's correction too. That is
+    the safe direction for the same reason -- a refusal costs one skipped
+    correction, a wrong acceptance is permanent. An ``observed`` carrying no stamp
+    matches nothing and so refuses every correction, rather than silently
+    comparing against nothing.
     """
     from kiro_crew.config.loader import _config_fingerprint
 
     try:
-        return _config_fingerprint() == fingerprint
-    except Exception:  # pragma: no cover - defensive
-        # A config that cannot be read cannot certify anything about itself.
+        return _config_fingerprint() == observed.get(_OBSERVED_CONFIG_FINGERPRINT)
+    except Exception:
+        logger.debug("config reconcile could not re-stamp the config files", exc_info=True)
         return False
 
 
@@ -314,13 +330,17 @@ def reconcile_member_config(
     the log becomes correct even when the config was edited by hand rather than
     through the dashboard (which emits its own member/config on save).
 
-    *config_fingerprint* is the caller's stamp of the config files it read
-    *agent_cfg* from, and it is required rather than defaulted because a caller
-    that cannot say which config a correction came from cannot have it applied
-    safely. The append goes through ``append_closer_if_still_applies`` with
-    ``_config_is_still_live_at``, re-asked under the per-slug write lock, so a
-    save that landed after the caller's load refuses the correction instead of
-    being overwritten by it. A refusal is a normal outcome, not a failure.
+    *config_fingerprint* is the stamp of the config files *agent_cfg* was read
+    from, taken just before that read. It is required rather than defaulted
+    because a caller that cannot say which files its correction came from cannot
+    have that correction applied safely, and a default would let the next caller
+    skip the question silently.
+
+    The append is conditional: it goes through
+    ``append_closer_if_still_applies`` with ``_config_is_still_live_at``,
+    re-stamped under the per-slug write lock, so a save that landed after the
+    caller's read refuses the correction instead of being overwritten by it. A
+    refusal is a normal outcome, not a failure, and the next read compares afresh.
 
     Returns the ``changed`` field list when an event was appended, ``None`` when
     nothing was written — either the roster already matched or the correction was
@@ -345,19 +365,16 @@ def reconcile_member_config(
         from kiro_crew.eventlog.service import get_service
         from kiro_crew.eventlog.types import MEMBER_CONFIG
 
-        def _config_is_still_live(values: dict, observed: dict) -> bool:
-            return _config_is_still_live_at(config_fingerprint, values, observed)
-
         svc = get_service()
         svc.ensure(slug, name or slug)
-        # No ``observed``: what this correction must be re-checked against is the
-        # config it was read from, which the fingerprint carries, and passing a
-        # projection block the predicate never reads would only suggest otherwise.
         appended = svc.append_closer_if_still_applies(
             slug,
             MEMBER_CONFIG,
             {**snapshot, "changed": changed},
-            still_applies=_config_is_still_live,
+            still_applies=_config_is_still_live_at,
+            # What the caller decided on is the state of the config files when it
+            # read them; the predicate re-stamps and compares against this.
+            observed={_OBSERVED_CONFIG_FINGERPRINT: config_fingerprint},
         )
         return changed if appended is not None else None
     except Exception:
@@ -546,15 +563,21 @@ def reconcile_members_at_startup(cfg, state, autonudge_svc) -> int:
         svc = get_service()
         agents = getattr(cfg, "agents", {}) or {}
         live_slots = getattr(state, "_slots", {}) if state is not None else {}
-        # The stamp for the config-reconcile guard, and the only one this function
-        # can take: *cfg* was read by the caller, so what this closes is the SWEEP's
-        # own duration -- it runs as a background task while the gateway goes live,
-        # long enough for a save to land between one member and the next. A save
-        # that landed between the caller's read and this entry is invisible here and
-        # stays out of the guard's reach.
-        from kiro_crew.config.loader import _config_fingerprint
+        # The config-reconcile step needs a stamp PAIRED with the read its values
+        # come from, and *cfg* is the caller's -- the gateway's boot config, handed
+        # to this sweep as a background task. A stamp taken here would certify
+        # files that a save could already have replaced since that read, which is
+        # the accepting direction. So this sweep performs its own paired read, and
+        # reconciles config against it.
+        #
+        # *cfg* still decides WHO is swept and answers every other question here
+        # (slug identity, the patrol and slot closers), because membership is not
+        # what the stamp verifies: a member added since the gateway booted is
+        # reconciled by the first roster read instead of this sweep.
+        from kiro_crew.config.loader import KiroCrewConfig, _config_fingerprint
 
         config_fingerprint = _config_fingerprint()
+        stamped_agents = getattr(KiroCrewConfig.load(), "agents", {}) or {}
 
         def _patrol_is_still_armed(values: dict, observed: dict) -> bool:
             return _patrol_is_still_armed_at(values, observed)
@@ -568,7 +591,7 @@ def reconcile_members_at_startup(cfg, state, autonudge_svc) -> int:
 
             return _still_open
 
-        for name, agent_cfg in agents.items():
+        for name in agents:
             if not _AGENT_NAME_RE.match(name):
                 continue
             try:
@@ -582,13 +605,19 @@ def reconcile_members_at_startup(cfg, state, autonudge_svc) -> int:
                 svc.ensure(slug, name)
                 snap = svc.snapshot(slug)
                 values = snap.get("values", {}) if isinstance(snap, dict) else {}
-                reconcile_member_config(
-                    slug,
-                    name,
-                    agent_cfg,
-                    values.get(types.PROJ_ROSTER, {}),
-                    config_fingerprint=config_fingerprint,
-                )
+                # The paired read's copy of this member, not the caller's: the
+                # stamp describes those files, so only their values can be
+                # verified against it. A member the paired read does not know
+                # gets no config correction; its closers below still run.
+                stamped_cfg = stamped_agents.get(name)
+                if stamped_cfg is not None:
+                    reconcile_member_config(
+                        slug,
+                        name,
+                        stamped_cfg,
+                        values.get(types.PROJ_ROSTER, {}),
+                        config_fingerprint=config_fingerprint,
+                    )
                 # Patrol closer.
                 wake = values.get(types.PROJ_WAKE, {}) or {}
                 if wake.get("patrol") == "armed":
