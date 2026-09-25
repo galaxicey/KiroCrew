@@ -5262,8 +5262,14 @@ class ScriptHookStore:
         parent_session_key: str | None = None,
         agent_role: str | None = None,
         hook_continuation_count: int = 0,
+        extra_hooks: Sequence[ScriptHook] = (),
     ) -> list[ScriptHookResult]:
         """Fire all enabled hooks matching the given event. Returns results.
+
+        ``extra_hooks`` run after the stored ones, through the same matcher, gate
+        and spawn, and are never persisted: they belong to the caller (an agent
+        spec's own ``hooks`` on a backend that cannot run them, see
+        :mod:`kiro_crew.agent_sdk.spec_hooks`), not to this store.
 
         For PreToolUse/PostToolUse, matcher filters by tool name.
         For AgentSpawn/UserPromptSubmit/Stop, all hooks for that event fire.
@@ -5313,7 +5319,7 @@ class ScriptHookStore:
         if agent_role:
             hook_event["agent_role"] = agent_role
 
-        for hook in list(self._hooks.values()):
+        for hook in [*self._hooks.values(), *extra_hooks]:
             if not hook.enabled or hook.event != event:
                 continue
             # Matcher filtering: for tool hooks, match tool name; for others, match context
