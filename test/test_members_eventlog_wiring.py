@@ -23,7 +23,8 @@ from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_state
 
 from kiro_crew import eventlog_hooks, members
-from kiro_crew.config.loader import KiroCrewAgentConfig, _config_fingerprint
+from kiro_crew.config import validation
+from kiro_crew.config.loader import KiroCrewAgentConfig, config_read_stamp
 from kiro_crew.eventlog import types
 from kiro_crew.eventlog.service import get_service, set_service
 
@@ -55,13 +56,13 @@ def _agent(**kw) -> KiroCrewAgentConfig:
 
 
 def _config_files_for_fingerprint(tmp_path, monkeypatch):
-    """Point the loader's config fingerprint at files this test owns.
+    """Point the config stamp at files this test owns.
 
-    ``_config_fingerprint`` reads ``config_path()`` / ``config_local_path()`` from
+    ``config_read_stamp`` reads ``config_path()`` / ``config_local_path()`` from
     ``kiro_crew.config.loader``, which is the pair the test suite patches. Returns
     the base file so a test can rewrite it to stand for a save landing on disk; the
-    local overlay is deliberately left absent (the fingerprint carries a sentinel
-    for a missing file, so its absence is stable rather than unstated).
+    local overlay is deliberately left absent, since the fingerprint carries a
+    sentinel for a missing file and its absence is therefore stable.
     """
     base = tmp_path / "config.json"
     base.write_text("{}", encoding="utf-8")
@@ -346,10 +347,11 @@ class TestApiMembersProjections:
         svc = get_service()
         assert svc.snapshot(slug)["values"][types.PROJ_ROSTER]["model"] == "claude-x"
 
-        # The save lands mid-request: `config.json` is rewritten and the save's own
-        # member/config is appended, both AFTER the next request's config load.
-        # Driven from `snapshot` because that is the row-loop step the window ends
-        # at, and once only, so the reconcile's own re-snapshot cannot re-fire it.
+        # The save lands mid-request: `config.json` is rewritten, the live config now
+        # answers with the saved model, and the save's own member/config is appended
+        # -- all AFTER the next request's config load. Driven from `snapshot` because
+        # that is the row-loop step the window ends at, and once only, so the
+        # reconcile's own re-snapshot cannot re-fire it.
         real_snapshot = svc.snapshot
         fired: list[bool] = []
 
@@ -373,13 +375,96 @@ class TestApiMembersProjections:
             f"roster fold regressed to the pre-save model ({roster['model']!r})"
         )
 
+    @pytest.mark.asyncio
+    async def test_a_save_the_file_fingerprint_cannot_see_is_still_refused(
+        self, tmp_path, monkeypatch
+    ):
+        """The stamp's second half catches a replacement the first half cannot.
+
+        ``_config_fingerprint`` compares device, inode, both timestamps, size and
+        mode. A filesystem reporting no usable inode can leave every one of them
+        equal across a replacement, and the fingerprint alone then certifies a
+        config the save has already replaced -- the accepting direction. So the
+        stamp also carries the config cache's invalidation generation, which every
+        successful write advances, and this test pins the fingerprint half to a
+        constant so only the generation can do the catching.
+        """
+        live = {"model": "claude-x"}
+        _config_files_for_fingerprint(tmp_path, monkeypatch)
+        # Stand in for a filesystem whose stat fields cannot distinguish the
+        # replacement: the fingerprint half is now blind to the save below.
+        monkeypatch.setattr("kiro_crew.config.loader._config_fingerprint", lambda: ("pinned",))
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.members.KiroCrewConfig.load",
+            lambda: _fake_config({CREW: _agent(model=live["model"])}),
+        )
+        state = _make_state(tmp_path)
+        app = _members_app(state)
+        slug = members.slug_for_name(CREW)
+
+        async with TestClient(TestServer(app)) as client:
+            await client.get("/api/members")
+        svc = get_service()
+        assert svc.snapshot(slug)["values"][types.PROJ_ROSTER]["model"] == "claude-x"
+
+        real_snapshot = svc.snapshot
+        fired: list[bool] = []
+
+        def _save_lands_then_snapshot(target: str):
+            if target == slug and not fired:
+                fired.append(True)
+                live["model"] = "gpt-y"
+                # A real save publishes the files and then drops the cache; the
+                # drop is what advances the generation. The files themselves are
+                # left alone here, because the pinned fingerprint stands for a
+                # filesystem that could not tell they had changed.
+                validation._CONFIG_CACHE.clear()
+                svc.append(slug, types.MEMBER_CONFIG, {"model": "gpt-y", "changed": ["model"]})
+            return real_snapshot(target)
+
+        monkeypatch.setattr(svc, "snapshot", _save_lands_then_snapshot)
+        async with TestClient(TestServer(app)) as client:
+            await client.get("/api/members")
+        monkeypatch.setattr(svc, "snapshot", real_snapshot)
+
+        assert fired, "the save never landed; this test proved nothing"
+        roster = svc.snapshot(slug)["values"][types.PROJ_ROSTER]
+        assert roster["model"] == "gpt-y", (
+            "a save the file fingerprint could not distinguish was overwritten: the "
+            f"roster fold regressed to the pre-save model ({roster['model']!r})"
+        )
+
+    def test_the_stamp_accepts_an_unchanged_config_and_refuses_a_cleared_cache(
+        self, tmp_path, monkeypatch
+    ):
+        """Both directions of the generation half, on the predicate itself.
+
+        The end-to-end test above proves the refusal reaches the roster fold; this
+        one proves the predicate discriminates rather than refusing everything,
+        which a stamp that never matched would also do.
+        """
+        _config_files_for_fingerprint(tmp_path, monkeypatch)
+        monkeypatch.setattr("kiro_crew.config.loader._config_fingerprint", lambda: ("pinned",))
+
+        stamp = config_read_stamp()
+        observed = {eventlog_hooks._OBSERVED_CONFIG_STAMP: stamp}
+        assert eventlog_hooks._config_is_still_live_at({}, observed) is True
+
+        validation._CONFIG_CACHE.clear()
+
+        assert eventlog_hooks._config_is_still_live_at({}, observed) is False
+
 
 # ---------------------------------------------------------------------------
 # 3. reconcile_members_at_startup: synthesize interrupted closers, once
 # ---------------------------------------------------------------------------
 class TestStartupReconcile:
-    def test_writes_one_closer_each_then_nothing_on_rerun(self):
+    def test_writes_one_closer_each_then_nothing_on_rerun(self, monkeypatch):
         cfg = _fake_config({CREW: _agent()})
+        # The sweep performs its OWN paired config read for the config-reconcile
+        # step, so the fixture config has to be what that read returns or every
+        # correction below is skipped and the sweep proves nothing.
+        monkeypatch.setattr("kiro_crew.config.loader.KiroCrewConfig.load", lambda: cfg)
         slug = members.slug_for_name(CREW)
         svc = get_service()
         svc.ensure(slug, CREW)
@@ -391,7 +476,7 @@ class TestStartupReconcile:
             CREW,
             cfg.agents[CREW],
             svc.snapshot(slug)["values"].get(types.PROJ_ROSTER, {}),
-            config_fingerprint=_config_fingerprint(),
+            config_stamp=config_read_stamp(),
         )
         # A wake armed for a slot the autonudge service does not hold, and a
         # driving.open slot missing from state._slots.
@@ -418,7 +503,7 @@ class TestStartupReconcile:
         assert eventlog_hooks.reconcile_members_at_startup(cfg, state, autonudge) == 0
         assert svc.last_seq(slug) == seq_after
 
-    def test_an_explicit_member_id_decides_which_log_is_reconciled(self):
+    def test_an_explicit_member_id_decides_which_log_is_reconciled(self, monkeypatch):
         """Reconcile by persisted identity, not by folding the display name.
 
         A member carrying an explicit ``member_id`` owns the log at that id. A
@@ -433,6 +518,10 @@ class TestStartupReconcile:
         assert folded != member_id, "fixture must distinguish the two identities"
 
         cfg = _fake_config({name: _agent(member_id=member_id)}, default=name)
+        # As above: the sweep reconciles config against its own paired read, and
+        # that correction is the sweep's only append here, so the fixture config
+        # has to be what that read returns.
+        monkeypatch.setattr("kiro_crew.config.loader.KiroCrewConfig.load", lambda: cfg)
         svc = get_service()
         svc.ensure(member_id, name)
         before = svc.last_seq(member_id)

@@ -2599,6 +2599,39 @@ def _cached_validated_data(fp: tuple | None = None) -> dict | None:
     return _CONFIG_CACHE.get(fp if fp is not None else _config_fingerprint())
 
 
+def config_read_stamp() -> tuple:
+    """Signature of the config state a read observes, for re-checking it later.
+
+    Pairs :func:`_config_fingerprint` with the cache's invalidation generation.
+    The fingerprint alone cannot see a replacement that leaves device, inode,
+    both timestamps, size and mode identical; the generation is advanced by every
+    successful write, so the pair covers what either half misses. ``load()``
+    already fences its own cache entry with exactly these two, and this is the
+    same fence offered to callers that must re-check a read of their own.
+
+    Take it BEFORE the read it describes. Taken afterwards it can certify a state
+    that had already been replaced while the read was in flight, which is the
+    accepting direction; taken before, a replacement mid-read only refuses work
+    that the next read repeats.
+    """
+    return (_CONFIG_CACHE.generation(), _config_fingerprint())
+
+
+def load_config_with_stamp() -> "tuple[tuple, KiroCrewConfig]":
+    """Load the config together with the stamp of the state it was read from.
+
+    The one helper for a caller whose decision is written later and must be
+    re-checked first: it takes the stamp and performs the read together, so the
+    two cannot come from different reads. Stamping here and then deciding from a
+    config the caller already held reintroduces precisely the staleness the stamp
+    exists to detect, so callers pass the pair on together.
+
+    One call for both, which also keeps the stat pass and the load on whichever
+    thread the caller already moved this work to.
+    """
+    return config_read_stamp(), KiroCrewConfig.load()
+
+
 def _store_validated_data(
     data: dict,
     fp: tuple,

@@ -26,7 +26,7 @@ from aiohttp import web
 
 import kiro_crew.dashboard.handlers as _h
 from kiro_crew import members as members_mod
-from kiro_crew.config.loader import KiroCrewConfig, default_project_dir
+from kiro_crew.config.loader import KiroCrewConfig, default_project_dir, load_config_with_stamp
 from kiro_crew.dashboard.chat_persistence import (
     pin_private_agent_store,
     rehydrate_slot_from_history_async,
@@ -240,25 +240,6 @@ def _slot_has_unflushed_rows(slot: object) -> bool:
     )
 
 
-def _load_config_with_fingerprint() -> tuple[tuple, KiroCrewConfig]:
-    """The roster's config load, stamped with the files it was read from.
-
-    The stamp goes with the config into ``reconcile_member_config``, which is
-    what binds a correction to the config it was computed from. It is taken
-    BEFORE the read rather than after: a stamp taken afterwards could certify a
-    config that had already been replaced while the read was in flight. Stale in
-    the refusing direction only skips a correction the next roster read makes
-    again; stale in the accepting direction is the regression the stamp exists to
-    prevent.
-
-    One thread hop for both, so the stat pass does not land on the event loop.
-    """
-    from kiro_crew.config.loader import _config_fingerprint
-
-    fingerprint = _config_fingerprint()
-    return fingerprint, KiroCrewConfig.load()
-
-
 async def api_members(request: web.Request) -> web.Response:
     """GET /api/members — crew roster with DM binding and cheap live status.
 
@@ -273,7 +254,7 @@ async def api_members(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     state: DashboardState | None = request.app.get("state")
-    config_fingerprint, cfg = await asyncio.to_thread(_load_config_with_fingerprint)
+    config_stamp, cfg = await asyncio.to_thread(load_config_with_stamp)
 
     # The roster's redaction chokepoint, shared with ``GET /api/agents`` so the
     # two endpoints cannot drift apart. Function-local for the same reason
@@ -564,12 +545,12 @@ async def api_members(request: web.Request) -> web.Response:
                             row["name"],
                             agent_cfg,
                             values.get("roster", {}),
-                            # The stamp of the config `agent_cfg` came from. This
-                            # read loads the config ONCE and projects every row
+                            # The stamp paired with the load `agent_cfg` came from.
+                            # This read loads the config ONCE and projects every row
                             # from it, so a save landing after that load leaves the
-                            # fold newer than what is held here; the stamp is what
+                            # fold newer than the values held here; the stamp is what
                             # lets the append refuse rather than regress it.
-                            config_fingerprint=config_fingerprint,
+                            config_stamp=config_stamp,
                         )
                         is not None
                     )
