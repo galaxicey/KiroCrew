@@ -1769,6 +1769,14 @@ class DiscordDispatcher:
         # Auth first (deny-by-default short-circuit).
         if not self._authorized(itx.user_id):
             return
+        if not itx.guild_id:
+            # A DM interaction names its peer, and every callback below answers
+            # that SAME channel without ever opening it, so this is where the
+            # pairing can be learned for the interaction direction. Recorded
+            # before any callback is issued, because the mid-send re-check runs
+            # inside the first one; and on the authorized path only, so a denied
+            # presser cannot plant a pairing. Mirrors transport.receive().
+            self.client.remember_dm_recipient(itx.channel_id, itx.user_id)
         # Guild interactions are accepted only in an allow-listed channel that
         # Discord confirms is a thread. This mirrors transport.receive().
         thread_id = itx.channel_id if itx.guild_id else ""
@@ -1791,6 +1799,7 @@ class DiscordDispatcher:
                     "🔒 Commands run in a direct message or an approved thread. "
                     "Post here and I will open a thread, or DM me.",
                     ephemeral=True,
+                    destination=itx.channel_id,
                 )
             return
         # A slash command is answered by its OWN callback, so it must not be
@@ -1813,6 +1822,7 @@ class DiscordDispatcher:
                     itx.interaction_token,
                     "🔒 The Discord channel is currently disabled by policy.",
                     ephemeral=True,
+                    destination=itx.channel_id,
                 )
                 return
             await self._on_command_interaction(itx)
@@ -1822,7 +1832,9 @@ class DiscordDispatcher:
         # the governance check below does off-loop profile-store I/O that can, on a
         # slow FS, exceed Discord's ~3s interaction-ack deadline. Acking is a no-op
         # UI dismissal; it does NOT resolve the approval or start a turn.
-        await self.client.ack_component_interaction(itx.interaction_id, itx.interaction_token)
+        await self.client.ack_component_interaction(
+            itx.interaction_id, itx.interaction_token, destination=itx.channel_id
+        )
 
         data = itx.custom_id or ""
 
@@ -1837,9 +1849,26 @@ class DiscordDispatcher:
         # kiro-cli approval until timeout, ~300s). Approve presses and [OPTIONS:]
         # turns stay blocked.
         _is_reject_press = data.startswith("a:") and data.rpartition(":")[2] == "0"
-        if not _is_reject_press and not await channel_inbound_permitted("discord"):
-            logger.info("discord interaction dropped: denied by channels governance policy")
-            return
+        if not _is_reject_press:
+            # The rosters are read ONCE before the ack, and the ack itself serves the
+            # REST ladder's waits while the governance read below is deliberately
+            # off-loop, so authorization can be withdrawn across that window. Re-read
+            # the same two things the pre-ack gate established -- the user roster and,
+            # for a guild press, the thread roster -- before anything resolves. The
+            # channel TYPE is immutable, so it is not re-resolved: only membership
+            # moves. Without this a stale Approve press executes the governed tool
+            # after the operator has already withdrawn it.
+            if not self._authorized(itx.user_id) or (
+                itx.guild_id and thread_id not in self._allowed_threads
+            ):
+                logger.info(
+                    "discord interaction dropped: authorization withdrawn during the "
+                    "acknowledgement"
+                )
+                return
+            if not await channel_inbound_permitted("discord"):
+                logger.info("discord interaction dropped: denied by channels governance policy")
+                return
 
         # Session picker: "s:<nonce>:<index>". The controller binds the nonce
         # to the owner, channel, message, TTL, and exact server-side choice list.
@@ -2932,7 +2961,11 @@ class DiscordDispatcher:
         async def _respond(text: str) -> None:
             assert self.client is not None
             await self.client.respond_interaction(
-                itx.interaction_id, itx.interaction_token, text, ephemeral=True
+                itx.interaction_id,
+                itx.interaction_token,
+                text,
+                ephemeral=True,
+                destination=itx.channel_id,
             )
 
         return _respond
@@ -2984,7 +3017,11 @@ class DiscordDispatcher:
             return
         if name == "help":
             await self.client.respond_interaction(
-                itx.interaction_id, itx.interaction_token, build_help_text(), ephemeral=True
+                itx.interaction_id,
+                itx.interaction_token,
+                build_help_text(),
+                ephemeral=True,
+                destination=itx.channel_id,
             )
             return
         if name == "model" and thread_id:
@@ -3002,6 +3039,7 @@ class DiscordDispatcher:
                 "private here. DM me `/model`, or send `!model` if you are happy "
                 "for the list to be visible in this thread.",
                 ephemeral=True,
+                destination=itx.channel_id,
             )
             return
         # Everything else is session-scoped. Acknowledge the interaction first so
@@ -3013,6 +3051,7 @@ class DiscordDispatcher:
             itx.interaction_token,
             f"Running `/{name}`…",
             ephemeral=True,
+            destination=itx.channel_id,
         )
         argument = " ".join(itx.options.values()).strip()
         synthetic = InboundMessage(

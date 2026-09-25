@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from kiro_crew.discord.client import (
+    _MAX_SNOWFLAKE_LEN,
     DISCORD_CHUNK_LIMIT,
     DiscordClient,
     DiscordInbound,
@@ -39,6 +40,14 @@ from kiro_crew.messaging.transport import (
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
+
+
+#: Upper bound on ids remembered as admitted threads or shared channels. Config
+#: rosters are operator-sized and runtime thread promotions are bounded by the
+#: authorized users' own thread counts, so a real install stays far below this.
+#: Crossing it leaves the predicate unable to tell a withdrawn id from one it
+#: never saw; both are refused, so the cap costs sends and never authorizes one.
+_MAX_REMEMBERED_ADMISSIONS = 4096
 
 
 def _coerce_snowflakes(value: object) -> frozenset[str] | None:
@@ -142,7 +151,26 @@ class DiscordTransport(MessagingTransport):
         # reload can replace those without dropping the threads this process
         # promoted at runtime (see ``reconfigure``).
         self._configured_threads: frozenset[str] = frozenset(self._allowed_threads)
+        # Every id this transport has ever admitted as a thread. Grows only: an id
+        # dropped from the roster stays here, which is what lets the mid-send
+        # re-check tell "a thread that was withdrawn" from "an id never seen".
+        # The client's type cache cannot answer that after a restart, because a
+        # configured thread's type is resolved lazily and a proactive notice to it
+        # may never have asked.
+        self._known_threads: set[str] = set()
+        # Set once the admission history has had to drop entries, so the overflow
+        # is reported once rather than on every write. Dropping an id cannot widen
+        # what the predicate permits: an id it cannot place is refused by the
+        # final arm either way.
+        self._admissions_overflowed = False
+        self._remember_admissions(self._known_threads, self._allowed_threads)
         self._allowed_channels: frozenset[str] = frozenset(str(c) for c in allowed_channel_ids)
+        # Every id this transport has ever admitted as a shared guild channel, on
+        # the same grow-only basis as ``_known_threads``: a thread promotion POSTs
+        # to the PARENT channel, so that id reaches the mid-send re-check and a
+        # withdrawal has to be distinguishable from an id never seen.
+        self._known_channels: set[str] = set()
+        self._remember_admissions(self._known_channels, self._allowed_channels)
         self._auto_thread = auto_thread
         self._on_thread_created = on_thread_created
         self._dispatch = dispatch
@@ -208,6 +236,7 @@ class DiscordTransport(MessagingTransport):
             )
         elif channels != self._allowed_channels:
             self._allowed_channels = channels
+            self._remember_admissions(self._known_channels, channels)
             logger.info("discord: channel allow-list reloaded (%d channel(s))", len(channels))
             sel().log_api_access(
                 caller="config",
@@ -226,6 +255,7 @@ class DiscordTransport(MessagingTransport):
         else:
             promoted = self._allowed_threads - self._configured_threads
             merged = set(threads) | promoted
+            self._remember_admissions(self._known_threads, merged)
             if merged != self._allowed_threads:
                 self._allowed_threads = merged
                 logger.info("discord: thread allow-list reloaded (%d thread(s))", len(merged))
@@ -385,6 +415,41 @@ class DiscordTransport(MessagingTransport):
             return True
         return bool(principal) and principal in self._allowed
 
+    def _remember_admissions(self, store: set[str], ids: Iterable[str]) -> None:
+        """Record ids as admitted destinations, under a named bound.
+
+        Two bounds, because a retained field needs both: each id must fit a
+        snowflake's length, and the store as a whole is capped. Crossing the cap is
+        recorded once, through :attr:`_admissions_overflowed`, so an operator can see
+        it happened; dropping an id only ever costs a send, because the predicate's
+        final arm refuses anything it cannot place.
+        """
+        for raw in ids:
+            candidate = str(raw)
+            if candidate and len(candidate) <= _MAX_SNOWFLAKE_LEN:
+                store.add(candidate)
+        if len(store) <= _MAX_REMEMBERED_ADMISSIONS:
+            return
+        if not self._admissions_overflowed:
+            self._admissions_overflowed = True
+            logger.warning(
+                "discord: admitted-destination history exceeded %d ids; the mid-send "
+                "re-check now refuses any destination it cannot place",
+                _MAX_REMEMBERED_ADMISSIONS,
+            )
+            try:
+                sel().log_api_access(
+                    caller="discord",
+                    operation="discord_transport.admission_history_overflow",
+                    outcome="bounded",
+                    source="discord",
+                    resources=f"cap={_MAX_REMEMBERED_ADMISSIONS}",
+                )
+            except Exception:
+                logger.debug("admission overflow audit failed", exc_info=True)
+        while len(store) > _MAX_REMEMBERED_ADMISSIONS:
+            store.pop()
+
     def _still_may_send_to(self, channel_id: str) -> bool:
         """May a channel the REST ladder already started sending to still be
         written to? Fails closed. Installed on the client as
@@ -392,35 +457,76 @@ class DiscordTransport(MessagingTransport):
 
         The ladder asks this after each of its own waits, holding a channel id and
         nothing else, so this answers strictly what a channel id can settle and
-        refuses when even that much is missing:
+        refuses when even that much is missing. Both CURRENT rosters are consulted
+        first, before any history: an id an operator has on a roster right now is
+        authorized whatever it was admitted as before, so moving one between
+        ``allowed_thread_ids`` and ``allowed_channel_ids`` reads as the
+        reclassification it is rather than as a withdrawal.
 
-        * an id on the thread roster passes -- the same set ``receive`` gates
-          inbound on and :meth:`may_send_to` consults, so a thread an operator
-          withdraws stops being written to mid-send;
-        * an id Discord has already told us is a thread, and which is NOT on the
+        * an id on the thread roster, or on the shared-channel roster, passes --
+          the same sets ``receive`` gates inbound on and :meth:`may_send_to`
+          consults, so a destination an operator withdraws stops being written to
+          mid-send;
+        * an id this transport has ever admitted as a thread, and which is on
+          neither roster, is refused. That set grows only, so it answers after a
+          restart, where a configured thread's type is resolved lazily and a
+          proactive notice to it may never have asked;
+        * an id Discord has already told us is a thread, and which is on neither
           roster, is refused. Only the client's CACHED channel types are read, so
           this costs no REST call and cannot recurse into the ladder it is guarding;
-          a type never seen falls to the roster test below rather than guessing;
-        * any other id is a DM channel, and the DM roster is keyed by the peer's
-          user id while a DM link persists the channel id ``create_dm_channel``
-          returned. The pairing is not derivable here, exactly as
-          :meth:`may_send_to` documents, so what remains answerable is whether the
-          roster admits ANYBODY: an empty roster authorizes nobody, and a send in
-          flight to a DM is refused on it.
+        * an id ever admitted as a shared guild channel and now on neither roster is
+          refused. A thread promotion POSTs to the PARENT channel, so a guild id
+          reaches here and is not a DM: without this arm an operator withdrawing a
+          channel mid-promotion still gets a public thread in it;
+        * an id this process opened as a DM is decided on ITS OWN peer: the client
+          kept the pairing when it created the channel, so the roster is asked about
+          the one user the message would actually reach;
+        * anything left is REFUSED. A DM channel whose peer is not derivable here --
+          the DM roster is keyed by the peer's user id while a DM link persists the
+          channel id ``create_dm_channel`` returned, and the pairing is not
+          re-derivable synchronously -- cannot be told from a withdrawn one, and at a
+          network egress boundary "cannot tell" reads as no. Asking instead whether
+          the roster admits ANYBODY would let one remaining peer authorize a
+          different, revoked one.
 
-        The narrower DM case -- one peer removed while others remain -- is the same
-        gap :meth:`may_send_to` carries and needs the same fix, a
-        ``dm_channel_id -> user_id`` pairing persisted when the DM is opened. It is
-        not widened here: this predicate only ever refuses sends the ladder would
-        otherwise have made.
+        The cost of that last arm is an unattended proactive DM whose destination was
+        read back from a link written before a restart, and which served one of the
+        ladder's waits: it is refused rather than delivered. The alternative is
+        delivering to a peer whose authorization may already be gone, which is the
+        thing this exists to stop. A caller that needs the send to survive can re-open
+        the DM through ``create_dm_channel``, which establishes the pairing.
         """
         if not channel_id:
             return False
         if channel_id in self._allowed_threads:
             return True
+        if channel_id in self._allowed_channels:
+            return True
+        if channel_id in self._known_threads:
+            return False
         if self._client.cached_channel_is_thread(channel_id) is True:
             return False
-        return bool(self._allowed)
+        if channel_id in self._known_channels:
+            return False
+        peer = self._client.cached_dm_recipient(channel_id)
+        if peer is not None:
+            return peer in self._allowed
+        if self._admissions_overflowed:
+            # Distinguish "this id was never placeable" from "its record was
+            # discarded to stay within the cap". Both refuse, but only the second
+            # is a capacity symptom, and a generic roster denial would read as the
+            # operator having withdrawn something.
+            try:
+                sel().log_api_access(
+                    caller=channel_id,
+                    operation="discord_transport.mid_send_refused_after_truncation",
+                    outcome="denied",
+                    source="discord",
+                    resources=f"cap={_MAX_REMEMBERED_ADMISSIONS}",
+                )
+            except Exception:
+                logger.debug("truncated-history refusal audit failed", exc_info=True)
+        return False
 
     # -- Lifecycle ----------------------------------------------------------
     async def connect(self) -> None:
@@ -530,6 +636,7 @@ class DiscordTransport(MessagingTransport):
                 # than the memory, which is bounded in practice by that user's
                 # own thread count.
                 self._allowed_threads.add(created)
+                self._remember_admissions(self._known_threads, (created,))
                 sel().log_api_access(
                     caller=inbound.user_id,
                     operation="discord_transport.auto_thread",
@@ -561,6 +668,13 @@ class DiscordTransport(MessagingTransport):
         )
         if not self.authorize(msg):
             return
+        if not inbound.guild_id:
+            # An authorized DM names its peer, and the reply goes to this same
+            # channel without ever opening it, so this is the one point the
+            # pairing can be learned for the inbound direction. Guild channels
+            # are excluded: their ids are decided by the channel rosters, not by
+            # a peer.
+            self._client.remember_dm_recipient(inbound.channel_id, inbound.user_id)
         if thread_id and not await self._client.is_thread_channel(thread_id):
             sel().log_api_access(
                 caller=inbound.user_id,

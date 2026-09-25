@@ -18,8 +18,11 @@ no network, no real sleeping, and no writes anywhere.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 from dataclasses import dataclass, field
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import aiohttp
@@ -27,12 +30,14 @@ import pytest
 from multidict import CIMultiDict
 
 from kiro_crew.discord import client as dc
+from kiro_crew.discord import transport as dt
 from kiro_crew.discord.client import (
     _REVOKED_DETAIL,
     DISCORD_BLOCKED,
     DISCORD_OK,
     DISCORD_TRANSIENT,
     DiscordClient,
+    DiscordInbound,
     _guarded_destination,
 )
 from kiro_crew.discord.transport import DiscordTransport
@@ -367,13 +372,137 @@ class TestChannelsCeiling:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A press's own reply names no channel, is re-judged against the live
-        rosters before it is answered, and has a ~3 second deadline, so the
-        roster is not consulted for it."""
+        rosters before it is answered, and has a ~3 second deadline, so NEITHER
+        authority is consulted for it: the route is classified first."""
         harness = _harness(monkeypatch, [_rate_limited(1.0), _Resp(200, {"ok": True})])
         result = await harness.client.api_json("POST", _CALLBACK_PATH, {})
         assert result.outcome == DISCORD_OK
         assert len(harness.requests) == 2
         assert harness.asked == []
+        # The ceiling read is a blocking ProfileStore read on a ~3s deadline, and
+        # an unguarded route cannot be refused on a destination it does not name.
+        assert [e for e in harness.events if e[0] == "ceiling"] == []
+
+    @pytest.mark.asyncio
+    async def test_a_guarded_route_does_read_the_ceiling_after_a_wait(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The control for the assertion above: the ceiling IS read once the
+        route names a channel, so its absence there is the classification
+        working rather than the ceiling never being read at all."""
+        harness = _harness(monkeypatch, [_rate_limited(1.0), _Resp(200, {"id": "2"})])
+        result = await harness.client.api_json("POST", _SEND_PATH, {})
+        assert result.outcome == DISCORD_OK
+        assert [e for e in harness.events if e[0] == "ceiling"] == [("ceiling", "discord")]
+
+
+# -- A caller supplies the destination its route cannot name -------------------
+
+
+class TestCallerSuppliedDestination:
+    """An interaction reply's destination rides inside an opaque token.
+
+    The path cannot yield it, but the dispatcher holds it, so the caller passes it
+    and the ladder re-checks the ROSTER across its waits. The ``channels`` ceiling
+    is a blocking governance read and stays off that path, which carries a deadline
+    of about three seconds.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_withdrawn_destination_stops_an_interaction_retry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        harness = _harness(monkeypatch, [_rate_limited(1.0), _Resp(200, {"ok": True})])
+        harness.revoke_during_next_wait()
+        result = await harness.client.api_json("POST", _CALLBACK_PATH, {}, destination=_CHANNEL)
+        assert result.outcome == DISCORD_BLOCKED
+        assert result.detail == _REVOKED_DETAIL
+        # The second attempt was never issued.
+        assert len(harness.requests) == 1
+        assert harness.asked == [_CHANNEL]
+
+    @pytest.mark.asyncio
+    async def test_a_still_permitted_destination_lets_the_retry_through(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        harness = _harness(monkeypatch, [_rate_limited(1.0), _Resp(200, {"ok": True})])
+        result = await harness.client.api_json("POST", _CALLBACK_PATH, {}, destination=_CHANNEL)
+        assert result.outcome == DISCORD_OK
+        assert len(harness.requests) == 2
+        assert harness.asked == [_CHANNEL]
+
+    @pytest.mark.asyncio
+    async def test_the_ceiling_stays_off_the_interaction_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The roster is consulted and the governance read is not, so the reply
+        pays no blocking ProfileStore read against its ~3s deadline."""
+        harness = _harness(monkeypatch, [_rate_limited(1.0), _Resp(200, {"ok": True})])
+        harness.ceiling["open"] = False
+        result = await harness.client.api_json("POST", _CALLBACK_PATH, {}, destination=_CHANNEL)
+        assert result.outcome == DISCORD_OK
+        assert [e for e in harness.events if e[0] == "ceiling"] == []
+        assert harness.asked == [_CHANNEL]
+
+    @pytest.mark.asyncio
+    async def test_an_unguarded_route_with_no_destination_is_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A caller that names no destination gets the prior behaviour: neither
+        authority is read, so this does not become a silent new refusal path."""
+        harness = _harness(monkeypatch, [_rate_limited(1.0), _Resp(200, {"ok": True})])
+        harness.revoke_during_next_wait()
+        result = await harness.client.api_json("POST", _CALLBACK_PATH, {})
+        assert result.outcome == DISCORD_OK
+        assert harness.asked == []
+        assert [e for e in harness.events if e[0] == "ceiling"] == []
+
+    @pytest.mark.asyncio
+    async def test_the_interaction_verbs_pass_their_destination(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Both verbs that issue an interaction route carry the destination down."""
+        seen: list[tuple[str, str]] = []
+
+        async def _api(
+            method: str, path: str, payload: Any, timeout: int = 30, *, destination: str = ""
+        ) -> Any:
+            seen.append((path, destination))
+            return {}
+
+        client = DiscordClient(token=_TOKEN)
+        monkeypatch.setattr(client, "_api", _api)
+        await client.respond_interaction("i1", "t1", "hi", destination="chan-a")
+        await client.ack_component_interaction("i2", "t2", destination="chan-b")
+        assert [d for _, d in seen] == ["chan-a", "chan-b"]
+        assert all(p.startswith("/interactions/") for p, _ in seen)
+
+    def test_every_dispatcher_call_site_names_its_destination(self) -> None:
+        """Enumerate-once gate over the dispatcher.
+
+        The predicate can only answer for a destination it is given, so a call site
+        that omits one silently restores the unguarded retry. Asserting this
+        structurally covers a call site added later, which a behavioural test of
+        today's seven would not. The value must come from the interaction record
+        itself, which carries the channel the opaque token hides.
+        """
+        from kiro_crew.discord import transport_dispatch as td
+
+        source = Path(td.__file__).read_text(encoding="utf-8")
+        verbs = {"respond_interaction", "ack_component_interaction"}
+        sites: list[tuple[int, str]] = []
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.Call):
+                continue
+            if getattr(node.func, "attr", None) not in verbs:
+                continue
+            passed = {kw.arg: ast.unparse(kw.value) for kw in node.keywords}
+            sites.append((node.lineno, passed.get("destination", "")))
+        assert len(sites) == 7, f"call-site count changed: {sites}"
+        missing = [ln for ln, dest in sites if not dest]
+        assert missing == [], f"interaction call sites with no destination: {missing}"
+        wrong = [(ln, d) for ln, d in sites if d != "itx.channel_id"]
+        assert wrong == [], f"destination not taken from the interaction record: {wrong}"
 
 
 # -- Fail-closed -------------------------------------------------------------
@@ -448,19 +577,26 @@ class TestTransportPredicate:
         """Discord channel types are immutable, so a cached type is never stale:
         a known thread missing from the roster has been withdrawn.
 
-        The DM roster is deliberately non-empty, so the fall-through below would
-        answer True: the refusal can only come from the thread check itself.
+        An allowed DM pairing is planted for the same id, so the final arm would
+        answer True: the refusal can only come from the cached-thread check.
         """
         transport, client = _transport(allowed_user_ids=["u1"], allowed_thread_ids=["555666777"])
         client._channel_types["888999000"] = 11
+        # An allowed DM pairing for the same id, so the final arm WOULD answer
+        # True: the refusal can only come from the cached-thread arm itself.
+        client._dm_recipients["888999000"] = "u1"
         assert transport._still_may_send_to("888999000") is False
 
-    def test_a_dm_channel_passes_while_the_roster_admits_anybody(self) -> None:
-        """A DM link persists the channel id, and the roster holds user ids, so
-        the pairing is not derivable here -- the same gap ``may_send_to``
-        documents. What is answerable is whether anyone is authorized at all."""
+    def test_an_unattributable_dm_is_refused(self) -> None:
+        """The roster admitting SOMEBODY is not the same as admitting this peer.
+
+        A DM link persists the channel id while the roster holds user ids, so a
+        channel this process never opened names nobody. Answering on "does the
+        roster admit anybody" would let one remaining peer authorize a different,
+        revoked one, so the arm refuses instead.
+        """
         transport, _ = _transport(allowed_user_ids=["u1"])
-        assert transport._still_may_send_to("444555666") is True
+        assert transport._still_may_send_to("444555666") is False
 
     def test_an_empty_roster_refuses_every_destination(self) -> None:
         """Deny-by-default: an empty allow-list authorizes nobody, so a send in
@@ -472,12 +608,153 @@ class TestTransportPredicate:
         transport, _ = _transport(allowed_user_ids=["u1"])
         assert transport._still_may_send_to("") is False
 
-    def test_an_unseen_channel_type_does_not_refuse_on_a_guess(self) -> None:
-        """``None`` from the cache means "not known here", and guessing either
-        way is worse than falling to the roster test."""
+    def test_an_unseen_channel_type_is_refused_by_the_final_arm_not_a_guess(self) -> None:
+        """``None`` from the cache means "not known here", so the thread arm does
+        not fire; the refusal comes from the final arm having no peer to ask about.
+
+        The pairing case below shows this is not a blanket refusal: the same
+        transport permits a channel whose peer it can actually name.
+        """
         transport, client = _transport(allowed_user_ids=["u1"])
         assert client.cached_channel_is_thread("123456789") is None
+        assert transport._still_may_send_to("123456789") is False
+        client._dm_recipients["123456789"] = "u1"
         assert transport._still_may_send_to("123456789") is True
+
+    def test_a_configured_thread_withdrawn_after_a_restart_is_refused(self) -> None:
+        """The case a cached type cannot answer.
+
+        A configured thread's type is resolved lazily, so after a restart a cron
+        or subagent notice to it may never have asked, leaving the cache empty.
+        The transport still admitted the id as a thread, so withdrawing it mid
+        back-off refuses rather than falling through to the DM arm.
+
+        An allowed DM pairing is planted for the same id, so the final arm would
+        answer True: the refusal can only come from the admitted-thread set.
+        """
+        transport, client = _transport(allowed_user_ids=["u1"], allowed_thread_ids=["555666777"])
+        assert client.cached_channel_is_thread("555666777") is None
+        transport._allowed_threads.discard("555666777")
+        # An allowed DM pairing, so the final arm WOULD answer True: the refusal
+        # can only come from the admitted-thread set.
+        client._dm_recipients["555666777"] = "u1"
+        assert transport._still_may_send_to("555666777") is False
+
+    def test_a_dm_this_process_opened_is_decided_on_its_own_peer(self) -> None:
+        """The client kept the pairing when it created the channel, so the roster
+        is asked about the one user the message would actually reach instead of
+        whether it admits anybody.
+
+        The roster keeps another user, so a decision made on "does the roster admit
+        anybody" would answer True: the refusal can only come from the pairing.
+        """
+        transport, client = _transport(allowed_user_ids=["u-keeps"])
+        client._dm_recipients["444555666"] = "u-revoked"
+        assert transport._still_may_send_to("444555666") is False
+
+    def test_a_dm_this_process_opened_for_an_allowed_peer_passes(self) -> None:
+        transport, client = _transport(allowed_user_ids=["u-keeps"])
+        client._dm_recipients["444555666"] = "u-keeps"
+        assert transport._still_may_send_to("444555666") is True
+
+    def test_an_authorized_inbound_dm_can_be_replied_to(self) -> None:
+        """An inbound DM names its peer, and the reply goes to that SAME channel
+        without ever opening it.
+
+        Driven through ``receive``, which is the wiring: recording the pairing in a
+        helper the dispatcher never calls would leave the reply refused. Without the
+        inbound half the fail-closed arm refuses a reply to a user who is on the
+        roster and just spoke, which is a dropped reply rather than a withheld one.
+        """
+        transport, client = _transport(allowed_user_ids=["u1"])
+        assert transport._still_may_send_to("dm-chan-1") is False
+        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+            transport.receive(
+                DiscordInbound(
+                    channel_id="dm-chan-1",
+                    user_id="u1",
+                    username="u",
+                    text="hello",
+                    message_id="m1",
+                    guild_id="",
+                )
+            )
+        )
+        assert client.cached_dm_recipient("dm-chan-1") == "u1"
+        assert transport._still_may_send_to("dm-chan-1") is True
+
+    def test_an_unauthorized_inbound_dm_records_no_pairing(self) -> None:
+        """The record is made on the AUTHORIZED path only, so a denied sender
+        cannot plant a pairing that would answer for their channel later."""
+        transport, client = _transport(allowed_user_ids=["u1"])
+        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+            transport.receive(
+                DiscordInbound(
+                    channel_id="dm-chan-2",
+                    user_id="intruder",
+                    username="x",
+                    text="hello",
+                    message_id="m2",
+                    guild_id="",
+                )
+            )
+        )
+        assert client.cached_dm_recipient("dm-chan-2") is None
+
+    def test_an_inbound_pairing_still_answers_for_the_peer_not_the_channel(self) -> None:
+        """Recording the pairing grants nothing on its own: the roster still
+        decides, so a peer removed after speaking is refused."""
+        transport, client = _transport(allowed_user_ids=["u1"])
+        client.remember_dm_recipient("dm-chan-1", "u-revoked")
+        assert transport._still_may_send_to("dm-chan-1") is False
+
+    def test_a_shared_channel_on_the_roster_is_still_permitted(self) -> None:
+        transport, _ = _transport(allowed_user_ids=["u1"], allowed_channel_ids=["777888999"])
+        assert transport._still_may_send_to("777888999") is True
+
+    def test_a_shared_channel_withdrawn_mid_promotion_is_refused(self) -> None:
+        """A thread promotion POSTs to the PARENT channel, so a guild id reaches
+        the predicate and is not a DM.
+
+        `create_thread_from_message` targets `/channels/{parent}/messages/{id}/threads`,
+        so the guarded destination is the parent. Withdrawing that channel during
+        the POST's back-off must stop the promotion, or a public thread appears in
+        a channel the operator just removed.
+
+        An allowed DM pairing is planted for the same id, so the final arm would
+        answer True: the refusal can only come from the admitted-channel set.
+        """
+        transport, client = _transport(allowed_user_ids=["u1"], allowed_channel_ids=["777888999"])
+        transport._allowed_channels = frozenset()
+        # An allowed DM pairing, so the final arm WOULD answer True: the refusal
+        # can only come from the admitted-channel set.
+        client._dm_recipients["777888999"] = "u1"
+        assert transport._still_may_send_to("777888999") is False
+
+    def test_a_reclassified_id_is_not_read_as_a_withdrawal(self) -> None:
+        """An operator who mislabels a shared channel in ``allowed_thread_ids`` and
+        then corrects it into ``allowed_channel_ids`` has reclassified it, not
+        withdrawn it.
+
+        The admitted-thread set grows only, so consulting it before the current
+        channel roster would refuse that id on every waited send -- including the
+        thread promotion, whose failure drops the user's message with no reply.
+        Both current rosters are therefore read before any history.
+        """
+        transport, _ = _transport(allowed_user_ids=["u1"], allowed_thread_ids=["777888999"])
+        assert "777888999" in transport._known_threads
+        transport.reconfigure(
+            SimpleNamespace(allowed_thread_ids=[], allowed_channel_ids=["777888999"])
+        )
+        assert transport._still_may_send_to("777888999") is True
+
+    def test_a_reloaded_channel_roster_keeps_admitting_what_it_has_seen(self) -> None:
+        """The admitted set grows across a reload, so a channel added by config and
+        later withdrawn is still distinguishable from an id never seen."""
+        transport, _ = _transport(allowed_user_ids=["u1"], allowed_channel_ids=["777888999"])
+        transport.reconfigure(SimpleNamespace(allowed_channel_ids=["101112131"]))
+        assert transport._still_may_send_to("101112131") is True
+        assert transport._still_may_send_to("777888999") is False
 
     def test_the_cached_reader_issues_no_request(self) -> None:
         """It runs INSIDE the REST ladder, so resolving a type there would
@@ -487,3 +764,280 @@ class TestTransportPredicate:
         client._channel_types["444555666"] = 0
         assert client.cached_channel_is_thread("555666777") is True
         assert client.cached_channel_is_thread("444555666") is False
+
+
+# -- The refusal is audited --------------------------------------------------
+
+
+class _Sel:
+    """Captures ``log_api_access`` calls, standing in for the SEL singleton."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def log_api_access(self, **kwargs: Any) -> None:
+        self.calls.append(kwargs)
+
+
+class TestRefusalsAreAudited:
+    """A mid-send refusal suppresses an already-composed, user-visible message.
+
+    The ladder's result carries the decision no further than its caller, so the
+    SEL row is the record it leaves -- matching ``may_send_to``, ``authorize``
+    and the inbound ceiling, which all record theirs.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_roster_refusal_is_recorded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        recorder = _Sel()
+        monkeypatch.setattr(dc, "sel", lambda: recorder)
+        harness = _harness(monkeypatch, [_rate_limited(2.0), _Resp(200, {"id": "2"})])
+        harness.revoke_during_next_wait()
+        result = await harness.client.api_json("POST", _SEND_PATH, {})
+        assert result.outcome == DISCORD_BLOCKED
+        assert [c["outcome"] for c in recorder.calls] == ["denied"]
+        assert recorder.calls[0]["operation"].endswith(".roster")
+        assert recorder.calls[0]["caller"] == _CHANNEL
+        assert recorder.calls[0]["source"] == "discord"
+
+    @pytest.mark.asyncio
+    async def test_a_ceiling_refusal_is_recorded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        recorder = _Sel()
+        monkeypatch.setattr(dc, "sel", lambda: recorder)
+        harness = _harness(monkeypatch, [_rate_limited(2.0), _Resp(200, {"id": "2"})])
+        harness.revoke_during_next_wait(ceiling=True)
+        result = await harness.client.api_json("POST", _SEND_PATH, {})
+        assert result.outcome == DISCORD_BLOCKED
+        assert [c["outcome"] for c in recorder.calls] == ["denied"]
+        assert recorder.calls[0]["operation"].endswith(".channels_ceiling")
+
+    @pytest.mark.asyncio
+    async def test_a_predicate_that_raises_is_recorded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        recorder = _Sel()
+        monkeypatch.setattr(dc, "sel", lambda: recorder)
+        harness = _harness(monkeypatch, [_rate_limited(2.0), _Resp(200, {"id": "2"})])
+
+        def _boom(channel_id: str) -> bool:
+            raise RuntimeError("roster unreadable")
+
+        harness.client.still_permitted = _boom
+        result = await harness.client.api_json("POST", _SEND_PATH, {})
+        assert result.outcome == DISCORD_BLOCKED
+        assert recorder.calls[0]["operation"].endswith(".predicate_raised")
+
+    @pytest.mark.asyncio
+    async def test_an_unwritable_audit_store_does_not_break_the_refusal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The refusal already stands, so letting the audit raise here would turn
+        every throttled send on a governed install into an exception."""
+
+        class _Broken:
+            def log_api_access(self, **kwargs: Any) -> None:
+                raise OSError("audit store unwritable")
+
+        monkeypatch.setattr(dc, "sel", lambda: _Broken())
+        harness = _harness(monkeypatch, [_rate_limited(2.0), _Resp(200, {"id": "2"})])
+        harness.revoke_during_next_wait()
+        result = await harness.client.api_json("POST", _SEND_PATH, {})
+        assert result.outcome == DISCORD_BLOCKED
+        assert result.detail == _REVOKED_DETAIL
+
+    @pytest.mark.asyncio
+    async def test_a_send_that_is_never_refused_records_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A send that never waits pays nothing: the rows are paced by the ladder's
+        own waits, not by traffic."""
+        recorder = _Sel()
+        monkeypatch.setattr(dc, "sel", lambda: recorder)
+        harness = _harness(monkeypatch, [_Resp(200, {"id": "2"})])
+        result = await harness.client.api_json("POST", _SEND_PATH, {})
+        assert result.outcome == DISCORD_OK
+        assert recorder.calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_post_wait_allow_is_recorded_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The allow is a permission decision as much as the refusal is, and the
+        ladder's result carries neither to anyone who could record it."""
+        recorder = _Sel()
+        monkeypatch.setattr(dc, "sel", lambda: recorder)
+        harness = _harness(monkeypatch, [_rate_limited(1.0), _Resp(200, {"id": "2"})])
+        result = await harness.client.api_json("POST", _SEND_PATH, {})
+        assert result.outcome == DISCORD_OK
+        assert [c["outcome"] for c in recorder.calls] == ["allowed"]
+        assert recorder.calls[0]["operation"].endswith(".roster")
+
+    @pytest.mark.asyncio
+    async def test_the_ceiling_is_the_recorded_authority_with_no_predicate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        recorder = _Sel()
+        monkeypatch.setattr(dc, "sel", lambda: recorder)
+        harness = _harness(
+            monkeypatch, [_rate_limited(1.0), _Resp(200, {"id": "2"})], wire_predicate=False
+        )
+        result = await harness.client.api_json("POST", _SEND_PATH, {})
+        assert result.outcome == DISCORD_OK
+        assert [c["outcome"] for c in recorder.calls] == ["allowed"]
+        assert recorder.calls[0]["operation"].endswith(".channels_ceiling")
+
+
+# -- Every retained field is bounded -----------------------------------------
+
+
+class TestRetentionIsBounded:
+    """Both stores the predicate reads grow with traffic, so both are capped.
+
+    Dropping history may only ever cost a send, never authorize one, so the
+    overflow makes the final fall-through refuse instead of trimming silently.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_dm_pairing_store_is_capped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Driven through ``create_dm_channel``, which is the retention site: a cap
+        on the helper alone would not prove this one uses it."""
+        _, client = _transport(allowed_user_ids=["u1"])
+
+        async def _api(method: str, path: str, payload: Any) -> Any:
+            return {"id": f"chan-{payload['recipient_id']}"}
+
+        monkeypatch.setattr(client, "_api", _api)
+        last = dc._MAX_TRACKED_DM_PEERS + 49
+        for i in range(dc._MAX_TRACKED_DM_PEERS + 50):
+            assert await client.create_dm_channel(f"u{i}") == f"chan-u{i}"
+        assert len(client._dm_recipients) == dc._MAX_TRACKED_DM_PEERS
+        # Least-recently-used eviction: the oldest pairings went, the newest stayed.
+        assert client.cached_dm_recipient("chan-u0") is None
+        assert client.cached_dm_recipient(f"chan-u{last}") == f"u{last}"
+
+    @pytest.mark.asyncio
+    async def test_an_over_long_channel_id_is_never_paired(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, client = _transport(allowed_user_ids=["u1"])
+        huge = "9" * 4096
+
+        async def _api(method: str, path: str, payload: Any) -> Any:
+            return {"id": huge}
+
+        monkeypatch.setattr(client, "_api", _api)
+        assert await client.create_dm_channel("u1") == huge
+        assert client.cached_dm_recipient(huge) is None
+
+    @pytest.mark.asyncio
+    async def test_reading_a_pairing_keeps_it_from_ageing_out(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The store is least-recently-used, so a pairing that is only ever READ
+        would age out while it is still in active use, and the next waited send to
+        that channel would be refused for want of a peer it had."""
+        _, client = _transport(allowed_user_ids=["u1"])
+
+        async def _api(method: str, path: str, payload: Any) -> Any:
+            return {"id": f"chan-{payload['recipient_id']}"}
+
+        monkeypatch.setattr(client, "_api", _api)
+        await client.create_dm_channel("keepme")
+        # Fill the store past its cap, reading the first pairing on every step.
+        for i in range(dc._MAX_TRACKED_DM_PEERS + 5):
+            assert client.cached_dm_recipient("chan-keepme") == "keepme"
+            await client.create_dm_channel(f"filler{i}")
+        assert client.cached_dm_recipient("chan-keepme") == "keepme"
+
+    def test_an_over_long_id_is_never_retained(self) -> None:
+        transport, client = _transport(allowed_user_ids=["u1"])
+        transport._remember_admissions(transport._known_threads, ["x" * 4096])
+        assert transport._known_threads == set()
+
+    def test_one_named_bound_covers_the_whole_snowflake_population(self) -> None:
+        """Both stores retain ids from the same population and the predicate reads
+        both, so widening one bound alone would make a withdrawal detectable on one
+        arm and not the other. One constant, imported, not copied.
+
+        Checked structurally: the value is a small int, so comparing the two
+        module attributes would pass even if the transport re-declared its own
+        literal. What must not exist is a second ASSIGNMENT.
+        """
+        source = Path(dt.__file__).read_text(encoding="utf-8")
+        assigned = [
+            target.id
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name) and target.id == "_MAX_SNOWFLAKE_LEN"
+        ]
+        assert assigned == [], "the transport must import the client's bound, not redeclare it"
+        assert dt._MAX_SNOWFLAKE_LEN == dc._MAX_SNOWFLAKE_LEN
+
+    def test_the_admission_history_is_capped(self) -> None:
+        transport, _ = _transport(allowed_user_ids=["u1"])
+        transport._remember_admissions(
+            transport._known_threads, [str(i) for i in range(dt._MAX_REMEMBERED_ADMISSIONS + 10)]
+        )
+        assert len(transport._known_threads) == dt._MAX_REMEMBERED_ADMISSIONS
+        assert transport._admissions_overflowed is True
+
+    def test_dropping_history_cannot_widen_what_is_permitted(self) -> None:
+        """Why the cap is safe: an id the predicate cannot place is refused, so
+        evicting admission history costs sends and never authorizes one.
+
+        The evicted id is given an allowed DM pairing, which is the ONLY thing that
+        could make the final arm answer True; it does not, because an evicted
+        thread id is still read as a destination this transport cannot vouch for.
+        """
+        transport, client = _transport(allowed_user_ids=["u1"], allowed_thread_ids=["444555666"])
+        assert transport._still_may_send_to("444555666") is True
+        transport._allowed_threads.discard("444555666")
+        assert transport._still_may_send_to("444555666") is False
+        transport._remember_admissions(
+            transport._known_threads, [str(i) for i in range(dt._MAX_REMEMBERED_ADMISSIONS + 10)]
+        )
+        assert transport._admissions_overflowed is True
+        assert transport._still_may_send_to("444555666") is False
+
+    def test_the_overflow_is_recorded_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        recorder = _Sel()
+        monkeypatch.setattr(dt, "sel", lambda: recorder)
+        transport, _ = _transport(allowed_user_ids=["u1"])
+        for _ in range(3):
+            transport._remember_admissions(
+                transport._known_threads,
+                [str(i) for i in range(dt._MAX_REMEMBERED_ADMISSIONS + 10)],
+            )
+        overflow = [c for c in recorder.calls if "admission_history_overflow" in c["operation"]]
+        assert len(overflow) == 1
+
+    def test_a_refusal_after_truncation_names_truncation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A discarded record and a withdrawn destination both refuse, but only the
+        first is a capacity symptom.
+
+        Auditing both as a generic roster denial would read as the operator having
+        withdrawn something, so the truncated case carries its own reason.
+        """
+        transport, _ = _transport(allowed_user_ids=["u1"])
+        transport._remember_admissions(
+            transport._known_threads, [str(i) for i in range(dt._MAX_REMEMBERED_ADMISSIONS + 10)]
+        )
+        assert transport._admissions_overflowed is True
+        recorder = _Sel()
+        monkeypatch.setattr(dt, "sel", lambda: recorder)
+        assert transport._still_may_send_to("444555666") is False
+        reasons = [c["operation"] for c in recorder.calls]
+        assert any("mid_send_refused_after_truncation" in r for r in reasons), reasons
+
+    def test_a_refusal_with_intact_history_does_not_claim_truncation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The control: without an overflow the refusal carries no truncation row,
+        so the reason means something when it does appear."""
+        transport, _ = _transport(allowed_user_ids=["u1"])
+        recorder = _Sel()
+        monkeypatch.setattr(dt, "sel", lambda: recorder)
+        assert transport._still_may_send_to("444555666") is False
+        reasons = [c["operation"] for c in recorder.calls]
+        assert not any("truncation" in r for r in reasons), reasons
