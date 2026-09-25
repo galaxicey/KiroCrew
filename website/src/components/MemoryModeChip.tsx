@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useLayoutEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { EyeOff, Ghost, Undo2, VenetianMask } from 'lucide-react'
 
@@ -11,9 +11,13 @@ interface MemoryModeChipProps {
   onSwitchMode: (mode: MemoryMode) => void
 }
 
+const GAP = 6
+const EDGE = 8
+
 /** Memory-mode chooser chip: opens an incognito/temporary popover, or offers the way back when one is active. */
 export function MemoryModeChip({ memoryMode, onSwitchMode }: MemoryModeChipProps) {
   const [open, setOpen] = useState(false)
+  const [pos, setPos] = useState<{ bottom: number; left: number } | null>(null)
   const btnRef = useRef<HTMLButtonElement>(null)
   const popRef = useRef<HTMLDivElement>(null)
 
@@ -25,8 +29,30 @@ export function MemoryModeChip({ memoryMode, onSwitchMode }: MemoryModeChipProps
       if (popRef.current?.contains(t) || btnRef.current?.contains(t)) return
       setOpen(false)
     }
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      setOpen(false)
+      btnRef.current?.focus()
+    }
     document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('mousedown', handler)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [open])
+
+  // Opens UPWARD (never over the composer): bottom edge GAP above the chip, centred and clamped to the viewport.
+  useLayoutEffect(() => {
+    if (!open) { setPos(null); return }
+    const b = btnRef.current?.getBoundingClientRect()
+    const p = popRef.current
+    if (!b || !p) return
+    const w = p.offsetWidth
+    const vw = window.innerWidth
+    const bottom = window.innerHeight - b.top + GAP
+    const left = Math.min(Math.max(EDGE, b.left + b.width / 2 - w / 2), Math.max(EDGE, vw - EDGE - w))
+    setPos({ bottom, left })
   }, [open])
 
   const currentMode = (memoryMode ?? 'persistent') as MemoryMode
@@ -63,8 +89,8 @@ export function MemoryModeChip({ memoryMode, onSwitchMode }: MemoryModeChipProps
           ref={popRef}
           data-testid="memory-mode-popover"
           className="fixed z-[9999] bg-bg-elevated border border-border rounded-xl shadow-xl p-2 flex flex-col sm:flex-row gap-2 max-w-[calc(100vw-16px)]"
-          // Opens UPWARD: its bottom edge sits 6px above the chip, so it never covers the composer below.
-          style={(() => { const r = btnRef.current?.getBoundingClientRect(); return { bottom: r ? window.innerHeight - r.top + 6 : '50%', left: r ? r.left + r.width / 2 : '50%', transform: 'translateX(-50%)' } })()}
+          // Hidden for the one layout pass before it is measured, so it never flashes at 0,0.
+          style={pos ? { bottom: pos.bottom, left: pos.left } : { bottom: 0, left: 0, visibility: 'hidden' }}
         >
           {([
             { key: 'incognito' as const, Icon: EyeOff, label: i18nT('components.welcomeView.incognito'), desc: i18nT('components.welcomeView.incognito_desc'), tile: 'bg-warn-subtle text-warn' },

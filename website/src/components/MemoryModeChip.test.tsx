@@ -15,6 +15,38 @@ describe('MemoryModeChip', () => {
     const pop = screen.getByTestId('memory-mode-popover')
     expect(pop.style.bottom).toBe(`${700 - 640 + 6}px`)
     expect(pop.style.top).toBe('')
+    expect(pop.style.visibility).toBe('')
+  })
+
+  describe('horizontal clamp', () => {
+    const openAt = (left: number, width: number) => {
+      vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(500)
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: 800 })
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: 700 })
+      renderWithProviders(<MemoryModeChip onSwitchMode={vi.fn()} />)
+      const btn = screen.getByText('Choose memory mode').closest('button')!
+      vi.spyOn(btn, 'getBoundingClientRect').mockReturnValue({ top: 600, bottom: 624, left, right: left + width, width, height: 24, x: left, y: 600, toJSON: () => ({}) } as DOMRect)
+      fireEvent.click(btn)
+      return screen.getByTestId('memory-mode-popover')
+    }
+
+    it('clamps to the left viewport edge', () => {
+      expect(openAt(0, 40).style.left).toBe('8px')
+    })
+
+    it('clamps to the right viewport edge', () => {
+      expect(openAt(780, 20).style.left).toBe(`${800 - 8 - 500}px`)
+    })
+  })
+
+  it('closes on Escape and returns focus to the chip trigger', () => {
+    renderWithProviders(<MemoryModeChip onSwitchMode={vi.fn()} />)
+    const btn = screen.getByText('Choose memory mode').closest('button')!
+    fireEvent.click(btn)
+    screen.getByText('Incognito').closest('button')!.focus()
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByTestId('memory-mode-popover')).not.toBeInTheDocument()
+    expect(btn).toHaveFocus()
   })
 
   it('picking an option switches mode and closes the popover', () => {

@@ -6566,8 +6566,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       project: old?.project ?? null,
       instanceId: old?.instance_id || undefined,
     }
-    try { await dispatch(createSlot(opts)).unwrap() } catch { return }
-    try { await dispatch(deleteSlot(activeSlot)).unwrap() } catch { /* new slot already active */ }
+    try { await dispatch(createSlot(opts)).unwrap() } catch (error) {
+      showActionError(errMessage(error) || i18nT('pages.chatPage.unknown_error'))
+      return
+    }
+    try { await dispatch(deleteSlot(activeSlot)).unwrap() } catch (error) {
+      showActionError(errMessage(error) || i18nT('pages.chatPage.unknown_error'))
+    }
   }
   // The non-orchestrator welcome screen puts its memory chip directly above the composer.
   const showComposerMemoryChip = isWelcomeState && (currentSlot?.mode || mode) !== 'orchestrator'
@@ -7560,7 +7565,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 </div>
               )}
               {showComposerMemoryChip && (
-                <div className="flex justify-center px-4 pt-2 pb-2" data-testid="composer-memory-chip">
+                // Opaque backdrop: at phone widths the welcome cards scroll under this row.
+                <div className="relative z-10 flex justify-center px-4 pt-2 pb-2 bg-bg" data-testid="composer-memory-chip">
                   <MemoryModeChip memoryMode={currentSlot?.memory_mode ?? 'persistent'} onSwitchMode={switchMemoryMode} />
                 </div>
               )}

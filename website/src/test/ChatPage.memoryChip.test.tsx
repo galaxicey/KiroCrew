@@ -4,7 +4,7 @@
  * mocked to nothing here, so any chip found comes from ChatPage's own slot.
  */
 import { describe, it, expect, vi } from 'vitest'
-import { render, screen, act } from '@testing-library/react'
+import { render, screen, act, fireEvent, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
 import { configureStore } from '@reduxjs/toolkit'
@@ -24,10 +24,12 @@ vi.mock('react-virtuoso', () => ({ Virtuoso: ({ data, itemContent }: VirtuosoMoc
 
 type Msg = { role: string; content: string }
 const detail = vi.hoisted(() => ({ messages: [] as Msg[] }))
+const createChatSlot = vi.hoisted(() => vi.fn())
+const deleteChatSlot = vi.hoisted(() => vi.fn().mockResolvedValue(undefined))
 vi.mock('../api/client', () => ({
   api: {
-    createChatSlot: vi.fn(),
-    deleteChatSlot: vi.fn().mockResolvedValue(undefined),
+    createChatSlot,
+    deleteChatSlot,
     chatSlots: vi.fn().mockResolvedValue([]),
     chatSlotDetail: vi.fn(async () => ({ messages: detail.messages, running: false, has_more: false, total: detail.messages.length })),
     chatHistory: vi.fn().mockResolvedValue({ sessions: [] }),
@@ -117,6 +119,30 @@ describe('memory chip above the composer', () => {
     const composer = screen.getAllByRole('textbox').at(-1)!
     // DOCUMENT_POSITION_FOLLOWING: the composer comes after the chip.
     expect(chip.compareDocumentPosition(composer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('shows an error when creating the replacement slot fails', async () => {
+    createChatSlot.mockRejectedValueOnce(new Error('Memory mode switch failed'))
+    await renderWith({ messages: [] })
+
+    fireEvent.click(screen.getByText('Choose memory mode').closest('button')!)
+    fireEvent.click(screen.getByText('Incognito').closest('button')!)
+
+    await waitFor(() => expect(screen.getByTestId('action-error')).toHaveTextContent('Memory mode switch failed'))
+    expect(deleteChatSlot).not.toHaveBeenCalled()
+  })
+
+  it('shows an error when deleting the old slot fails', async () => {
+    createChatSlot.mockResolvedValueOnce({ key: 'slot-b', messages: 0, running: false, memory_mode: 'incognito' })
+    deleteChatSlot.mockRejectedValueOnce(new Error('Old session delete failed'))
+    await renderWith({ messages: [] })
+
+    fireEvent.click(screen.getByText('Choose memory mode').closest('button')!)
+    fireEvent.click(screen.getByText('Incognito').closest('button')!)
+
+    await waitFor(() => expect(deleteChatSlot).toHaveBeenCalledWith('slot-a'))
+    // deleteSlot rethrows its own 'save failed' in place of the API error.
+    await waitFor(() => expect(screen.getByTestId('action-error')).toHaveTextContent('save failed'))
   })
 
   it('is absent once the session has messages', async () => {
