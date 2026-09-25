@@ -23,7 +23,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_state
 
 from kiro_crew import eventlog_hooks, members
-from kiro_crew.config.loader import KiroCrewAgentConfig
+from kiro_crew.config.loader import KiroCrewAgentConfig, _config_fingerprint
 from kiro_crew.eventlog import types
 from kiro_crew.eventlog.service import get_service, set_service
 
@@ -52,6 +52,24 @@ def _fake_config(agents: dict[str, KiroCrewAgentConfig], default=CREW):
 
 def _agent(**kw) -> KiroCrewAgentConfig:
     return KiroCrewAgentConfig(kiro_agent=kw.pop("kiro_agent", "reviewer"), **kw)
+
+
+def _config_files_for_fingerprint(tmp_path, monkeypatch):
+    """Point the loader's config fingerprint at files this test owns.
+
+    ``_config_fingerprint`` reads ``config_path()`` / ``config_local_path()`` from
+    ``kiro_crew.config.loader``, which is the pair the test suite patches. Returns
+    the base file so a test can rewrite it to stand for a save landing on disk; the
+    local overlay is deliberately left absent (the fingerprint carries a sentinel
+    for a missing file, so its absence is stable rather than unstated).
+    """
+    base = tmp_path / "config.json"
+    base.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: base)
+    monkeypatch.setattr(
+        "kiro_crew.config.loader.config_local_path", lambda: tmp_path / "config.local.json"
+    )
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +317,62 @@ class TestApiMembersProjections:
         assert newest["data"]["changed"] == ["model"]
         assert newest["data"]["model"] == "gpt-y"
 
+    @pytest.mark.asyncio
+    async def test_a_save_landing_mid_request_survives_the_config_reconcile(
+        self, tmp_path, monkeypatch
+    ):
+        """A save that lands after this request's config load is not overwritten.
+
+        ``api_members`` loads the config ONCE and then projects every row from it.
+        A save landing after that load writes ``config.json`` and appends its own
+        ``member/config``, so the fold is NEWER than the config this request is
+        holding. The reconcile compares the two, finds them different, and -- still
+        carrying the older values -- would append those: the roster fold is
+        last-wins per field, so the projection regresses to the pre-save model.
+        """
+        live = {"model": "claude-x"}
+        base = _config_files_for_fingerprint(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.members.KiroCrewConfig.load",
+            lambda: _fake_config({CREW: _agent(model=live["model"])}),
+        )
+        state = _make_state(tmp_path)
+        app = _members_app(state)
+        slug = members.slug_for_name(CREW)
+
+        # Baseline: one read folds the pre-save model into the roster.
+        async with TestClient(TestServer(app)) as client:
+            await client.get("/api/members")
+        svc = get_service()
+        assert svc.snapshot(slug)["values"][types.PROJ_ROSTER]["model"] == "claude-x"
+
+        # The save lands mid-request: `config.json` is rewritten and the save's own
+        # member/config is appended, both AFTER the next request's config load.
+        # Driven from `snapshot` because that is the row-loop step the window ends
+        # at, and once only, so the reconcile's own re-snapshot cannot re-fire it.
+        real_snapshot = svc.snapshot
+        fired: list[bool] = []
+
+        def _save_lands_then_snapshot(target: str):
+            if target == slug and not fired:
+                fired.append(True)
+                live["model"] = "gpt-y"
+                base.write_text('{"agents": {}}', encoding="utf-8")
+                svc.append(slug, types.MEMBER_CONFIG, {"model": "gpt-y", "changed": ["model"]})
+            return real_snapshot(target)
+
+        monkeypatch.setattr(svc, "snapshot", _save_lands_then_snapshot)
+        async with TestClient(TestServer(app)) as client:
+            await client.get("/api/members")
+        monkeypatch.setattr(svc, "snapshot", real_snapshot)
+
+        assert fired, "the save never landed; this test proved nothing"
+        roster = svc.snapshot(slug)["values"][types.PROJ_ROSTER]
+        assert roster["model"] == "gpt-y", (
+            "the config reconcile overwrote a save that landed mid-request: the "
+            f"roster fold regressed to the pre-save model ({roster['model']!r})"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 3. reconcile_members_at_startup: synthesize interrupted closers, once
@@ -313,7 +387,11 @@ class TestStartupReconcile:
         # step is a no-op — this test is about the two interrupted CLOSERS, not
         # the incidental first member/config.
         eventlog_hooks.reconcile_member_config(
-            slug, CREW, cfg.agents[CREW], svc.snapshot(slug)["values"].get(types.PROJ_ROSTER, {})
+            slug,
+            CREW,
+            cfg.agents[CREW],
+            svc.snapshot(slug)["values"].get(types.PROJ_ROSTER, {}),
+            config_fingerprint=_config_fingerprint(),
         )
         # A wake armed for a slot the autonudge service does not hold, and a
         # driving.open slot missing from state._slots.
