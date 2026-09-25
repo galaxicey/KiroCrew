@@ -477,6 +477,44 @@ class TestAWithheldVerdictIsRetainedInFull:
         assert ARTIFACT_OUTPUT not in (tmp_path / "step-output.txt").read_text(encoding="utf-8")
 
     @pytest.mark.parametrize("lane", LANE_PARAMS)
+    def test_withheld_is_told_from_no_verdict_without_reading_the_board(
+        self, lane: str, tmp_path: Path
+    ) -> None:
+        """The distinction the whole mechanism exists for.
+
+        A run that could not publish and a revision nobody reviewed look the same
+        on the board: the slot holds no verdict for this head either way, and an
+        annotation can read like a completed publish while the write was refused.
+        So the answer may not be taken from the annotation or the step's status.
+        It is taken from the write itself, which is why these three cases are
+        distinguishable with the board ignored entirely.
+        """
+        withheld = tmp_path / "withheld"
+        published = tmp_path / "published"
+        for directory in (withheld, published):
+            directory.mkdir()
+
+        refused = _run(lane, withheld, GH_SLOT_HELD_BY_OTHER_HEAD, _driver(CREATE_CALL))
+        assert "RC=2" in refused.stdout, refused.stdout
+        wrote = _run(lane, published, GH_SLOT_EMPTY_WRITE_OK, _driver(CREATE_CALL))
+        assert "RC=0" in wrote.stdout, wrote.stdout
+
+        # A verdict exists and did not reach its slot.
+        assert _receipt(withheld)["outcome"] == "withheld"
+        assert (withheld / RETAIN_DIR / "verdict.md").read_text(encoding="utf-8") == VERDICT_BODY
+        # A verdict exists and did reach it.
+        assert not (published / RETAIN_DIR).exists()
+        # No verdict was reached at all: the lane never runs the write, so there
+        # is nothing to retain and no record appears. The absence of a record is
+        # therefore not evidence of a published verdict on its own -- which is
+        # why the record carries the outcome rather than only the body.
+        never = tmp_path / "never"
+        never.mkdir()
+        idle = _run(lane, never, GH_SLOT_EMPTY_WRITE_OK, _driver('echo "RC=none"\n'))
+        assert "RC=none" in idle.stdout, idle.stdout
+        assert not (never / RETAIN_DIR).exists()
+
+    @pytest.mark.parametrize("lane", LANE_PARAMS)
     def test_the_withhold_is_announced_and_the_upload_is_armed(
         self, lane: str, tmp_path: Path
     ) -> None:
