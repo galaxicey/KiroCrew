@@ -509,8 +509,11 @@ jobs:
       # change. The baseline makes the gate real for everything else, so new code
       # is formatted without any PR being forced to carry unrelated churn.
       - name: Check formatting (black, baselined)
-        # Fleet/local checks recycle at most two workers, capped at 2 GiB each
-        # on Linux. Hosted CI keeps the native command and default worker count.
+        # Every runner recycles black workers: one file per child, at most eight,
+        # capped at 2 GiB each on Linux. Hosted `ubuntu-latest` needs this too:
+        # the compiled wheel retains memory per worker and the VM has no cgroup
+        # cap, so a native pool takes the whole 16 GB runner down mid-step (exit
+        # 143). Recycling costs ~1.6x native wall time on four cores.
         # Keep cgroup evidence: per-process limits do not bound the whole job.
         run: python3 scripts/ci_black_diagnostics.py scripts/check_black_formatting.py
 

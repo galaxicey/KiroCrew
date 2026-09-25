@@ -515,11 +515,17 @@ All eight `backend-test` shards use `linux_runner_large`; all eight
 `backend-test-windows` shards and `backend-test-windows-fail-closed` use the
 centrally resolved large Windows label. `e2e-boot-matrix` maps its Linux and
 Windows legs to those outputs without changing `matrix.os`, names, timeouts or
-artifact names. `backend-lint` uses large on the fleet. The formatter gate keeps
-Black's original native CLI and default worker selection when `RUNNER_ENVIRONMENT`
-is explicitly `github-hosted`; the CI step does not set `BLACK_NUM_WORKERS`.
-Fleet and local checks use `scripts/bounded_black.py`, with at most eight workers
-regardless of the native pool size. `scripts/ci_black_diagnostics.py` runs the gate
+artifact names. `backend-lint` uses large on the fleet. The formatter gate runs
+`scripts/bounded_black.py` on every runner -- fleet, GitHub-hosted and local --
+with at most eight workers regardless of the native pool size; the CI step does
+not set `BLACK_NUM_WORKERS`. Hosted runners originally kept Black's native CLI and
+default pool, and every fork PR's lint job then died mid-step with exit 143 after
+6-9 minutes ([#13689](https://github.com/kirodotdev/KiroCrew/issues/13689)):
+`ubuntu-latest` installs the compiled Black wheel, whose per-worker retention is
+the same failure the fleet measured, and the hosted VM has no cgroup cap
+(`memory.max: max`, 16 GB host), so the runner itself was torn down instead of a
+worker being OOM-killed. Recycling costs about 1.6x native wall time on four
+cores; more workers than cores do not shorten it. `scripts/ci_black_diagnostics.py` runs the gate
 once, preserves its failure status and stderr, and records bounded cgroup readings
 and child peak RSS. Worker count alone does not bound retained formatting trees:
 [the env-only two-worker fleet run](https://github.com/kirodotdev/KiroCrew/actions/runs/35417525930/job/105829161045)
