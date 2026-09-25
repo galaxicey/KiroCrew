@@ -201,7 +201,7 @@ def _mapping_stub(uris: list[str]):
             data["resources"] = merged
         else:
             data.pop("resources", None)
-        return list(keys), []
+        return list(keys), [], list(uris)
 
     return _apply
 

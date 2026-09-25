@@ -2490,12 +2490,17 @@ def apply_skill_mapping(
     state: DashboardState,
     keys: list[str],
     session_key: str = "",
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str]]:
     """Rewrite *data*'s ``skill://`` resources to *keys*, in place.
 
-    Returns ``(applied_keys, unknown_keys)``. Nothing is written when
-    *unknown_keys* is non-empty — the caller rejects the whole request so a
-    typo'd key can never partially apply.
+    Returns ``(applied_keys, unknown_keys, applied_uris)``. ``applied_uris[i]`` is
+    the ``skill://`` resource written for ``applied_keys[i]``, in request order --
+    the one statement of which entries of the rewritten list are the managed ones,
+    resolved against the same catalog walk that validated the keys, so a caller
+    that must re-apply the request's order onto a later read of the spec never
+    has to guess it from the list's shape. Nothing is written when *unknown_keys*
+    is non-empty -- the caller rejects the whole request so a typo'd key can never
+    partially apply.
 
     Invariants:
 
@@ -2523,7 +2528,7 @@ def apply_skill_mapping(
         applied.append(key)
         uris.append(uri)
     if unknown:
-        return applied, unknown
+        return applied, unknown, uris
 
     resources = data.get("resources") or []
     if not isinstance(resources, list):
@@ -2543,7 +2548,7 @@ def apply_skill_mapping(
         # key is absent/empty), and an agent with nothing mapped should fall
         # back to those defaults — so drop the key instead of writing [].
         data.pop("resources", None)
-    return applied, unknown
+    return applied, unknown, uris
 
 
 def list_skill_tree(skill_root: Path) -> list[dict[str, Any]]:

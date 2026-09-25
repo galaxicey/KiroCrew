@@ -328,12 +328,16 @@ class TestApplySkillMapping:
         agent = _agents_dir(fake_home) / "a.json"
         data = {"name": "a", "resources": ["file://.kiro/steering/**/*.md"]}
 
-        applied, unknown = apply_skill_mapping(
+        applied, unknown, uris = apply_skill_mapping(
             data, agent, state, ["kiro-user/one", "kiro-user/two"]
         )
 
         assert unknown == []
         assert applied == ["kiro-user/one", "kiro-user/two"]
+        assert uris == [
+            "skill://~/.kiro/skills/one/SKILL.md",
+            "skill://~/.kiro/skills/two/SKILL.md",
+        ]
         assert data["resources"] == [
             "file://.kiro/steering/**/*.md",
             "skill://~/.kiro/skills/one/SKILL.md",
@@ -347,7 +351,7 @@ class TestApplySkillMapping:
         agent = _agents_dir(fake_home) / "a.json"
         data = {"resources": ["file://keep.md"]}
 
-        applied, unknown = apply_skill_mapping(
+        applied, unknown, _uris = apply_skill_mapping(
             data, agent, state, ["kiro-user/one", "kiro-user/ghost"]
         )
 
@@ -410,7 +414,7 @@ class TestApplySkillMapping:
         agent = _agents_dir(fake_home) / "a.json"
         data: dict = {}
 
-        applied, _ = apply_skill_mapping(data, agent, state, ["kiro-user/one", "kiro-user/one"])
+        applied, _, _ = apply_skill_mapping(data, agent, state, ["kiro-user/one", "kiro-user/one"])
 
         assert applied == ["kiro-user/one"]
         assert data["resources"] == ["skill://~/.kiro/skills/one/SKILL.md"]
@@ -476,6 +480,186 @@ class TestPatchRejectionLeavesStateIntact:
             request = _FakeRequest("PATCH", {"name": "victim"}, body, _State())
             resp = asyncio.run(agents_handlers.api_agent_detail(request))
             assert resp.status == 400, f"body {body!r} should be rejected, not 500"
+
+
+class _RefreshingState(_State):
+    """``_State`` plus the refresh hook a successful PATCH calls on its way out."""
+
+    def push_refresh(self, kind: str) -> None:
+        pass
+
+
+class TestPatchReordersManagedSkills:
+    """A ``skills`` PATCH that permutes the mapped skills must persist that order.
+
+    ``apply_skill_mapping`` rebuilds ``resources`` as every non-managed entry first,
+    then the managed ``skill://`` URIs in request order. So the list it hands the
+    locked merge differs from the persisted one both when the caller reordered the
+    skills AND when the author merely interleaved a ``file://`` glob (or a
+    hand-written wildcard) between two skills. The merge has to tell those apart:
+    honour the first, leave the second byte-for-byte alone.
+    """
+
+    ONE = "skill://~/.kiro/skills/one/SKILL.md"
+    TWO = "skill://~/.kiro/skills/two/SKILL.md"
+    THREE = "skill://~/.kiro/skills/three/SKILL.md"
+
+    def _agent(self, fake_home: Path, monkeypatch, resources: list) -> Path:
+        from kiro_crew.dashboard.handlers import agents as agents_handlers
+
+        _make_skill(fake_home / ".kiro" / "skills", "one")
+        _make_skill(fake_home / ".kiro" / "skills", "two")
+        d = _agents_dir(fake_home)
+        cfg = d / "victim.json"
+        # The handler's own serialisation (``json.dump(..., indent=2)`` plus a newline),
+        # so a byte comparison after the PATCH measures the resources merge alone.
+        cfg.write_text(
+            json.dumps({"name": "victim", "resources": resources}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(agents_handlers, "KIRO_AGENTS_DIR", d, raising=False)
+        monkeypatch.setattr("kiro_crew.agent.KIRO_AGENTS_DIR", d, raising=False)
+        return cfg
+
+    @staticmethod
+    def _patch(skills: list[str]):
+        import asyncio
+
+        from kiro_crew.dashboard.handlers import agents as agents_handlers
+
+        request = _FakeRequest("PATCH", {"name": "victim"}, {"skills": skills}, _RefreshingState())
+        resp = asyncio.run(agents_handlers.api_agent_detail(request))
+        assert resp.status == 200, resp.text
+        return json.loads(resp.text)
+
+    def test_a_pure_reorder_persists_and_the_response_reports_the_persisted_order(
+        self, fake_home, monkeypatch
+    ):
+        """Same members, new order: the spec must carry the new order, not just the reply.
+
+        The membership delta of a permutation is empty, so a merge that moves only what
+        was added or removed keeps the persisted order -- while the handler answers
+        ``ok`` with the order the caller asked for, so nothing tells the caller the
+        write was discarded.
+        """
+        cfg = self._agent(
+            fake_home, monkeypatch, ["file://.kiro/steering/**/*.md", self.ONE, self.TWO]
+        )
+
+        body = self._patch(["kiro-user/two", "kiro-user/one"])
+
+        landed = json.loads(cfg.read_text(encoding="utf-8"))["resources"]
+        assert landed == [
+            "file://.kiro/steering/**/*.md",
+            self.TWO,
+            self.ONE,
+        ], f"the reorder was not persisted: {landed!r}"
+        assert body["skills"] == ["kiro-user/two", "kiro-user/one"]
+
+    def test_naming_the_current_skills_in_their_current_order_keeps_an_interleaved_layout(
+        self, fake_home, monkeypatch
+    ):
+        """A no-op PATCH over an interleaved spec must stay a no-op, byte for byte.
+
+        The mapping hoists the ``file://`` glob and the hand-written wildcard ahead of
+        both skills, so the list it produces differs from the persisted one although the
+        caller changed nothing. A merge that re-applied that whole list would rewrite
+        the author's layout on every PATCH that so much as mentions the existing skills.
+        """
+        cfg = self._agent(
+            fake_home,
+            monkeypatch,
+            [
+                self.ONE,
+                "file://.kiro/steering/**/*.md",
+                "skill://~/.kiro/skills/*/SKILL.md",
+                self.TWO,
+            ],
+        )
+        before = cfg.read_bytes()
+
+        body = self._patch(["kiro-user/one", "kiro-user/two"])
+
+        assert cfg.read_bytes() == before, cfg.read_text(encoding="utf-8")
+        assert body["skills"] == ["kiro-user/one", "kiro-user/two"]
+
+    def test_a_reorder_never_resurrects_a_uri_a_concurrent_writer_removed(
+        self, fake_home, monkeypatch
+    ):
+        """The requested order applies to the URIs the fresh read still carries, only.
+
+        The order was computed against a snapshot taken before the spec lock. A URI a
+        co-owner unmapped in between is gone from the locked read and must stay gone;
+        the reply then reports what was persisted, so the caller can see the difference.
+
+        The removed skill is named FIRST in a three-skill reorder on purpose: a merge
+        that paired the requested order with the merged list's slots without dropping
+        the absent URI would write it back into slot 0 and push the last carried URI
+        off the end -- named last, the absent URI would fall off the pairing unseen.
+        """
+        from kiro_crew.dashboard.handlers import agents as agents_handlers
+
+        cfg = self._agent(fake_home, monkeypatch, [self.ONE, self.TWO, self.THREE])
+        _make_skill(fake_home / ".kiro" / "skills", "three")
+        real_read = agents_handlers._read_agent_spec
+        calls = {"n": 0}
+
+        def racing_read(path, **kwargs):
+            calls["n"] += 1
+            result = real_read(path, **kwargs)
+            # After the pre-lock re-read, a co-owner unmaps ``one``. The locked read
+            # that follows sees the removal; this writer's snapshot never did.
+            if calls["n"] == 2:
+                cfg.write_text(json.dumps({"name": "victim", "resources": [self.TWO, self.THREE]}))
+            return result
+
+        monkeypatch.setattr(agents_handlers, "_read_agent_spec", racing_read)
+
+        body = self._patch(["kiro-user/one", "kiro-user/three", "kiro-user/two"])
+
+        landed = json.loads(cfg.read_text(encoding="utf-8"))["resources"]
+        assert landed == [
+            self.THREE,
+            self.TWO,
+        ], f"a concurrently removed URI came back or a carried one was lost: {landed!r}"
+        assert body["skills"] == ["kiro-user/three", "kiro-user/two"], body
+
+    def test_a_skill_a_concurrent_writer_added_is_kept_and_reported(self, fake_home, monkeypatch):
+        """The reply lists every skill the WRITTEN spec maps, not only the ones requested.
+
+        A co-owner maps a third skill between this writer's snapshot and the locked
+        read. The merge keeps it -- it is not a URI this request removed -- so the reply
+        has to carry it as well: the skills editor takes the reply as its next state,
+        and a reply missing the addition would have the editor's next toggle unmap it.
+        """
+        from kiro_crew.dashboard.handlers import agents as agents_handlers
+
+        cfg = self._agent(fake_home, monkeypatch, [self.ONE, self.TWO])
+        _make_skill(fake_home / ".kiro" / "skills", "three")
+        real_read = agents_handlers._read_agent_spec
+        calls = {"n": 0}
+
+        def racing_read(path, **kwargs):
+            calls["n"] += 1
+            result = real_read(path, **kwargs)
+            # After the pre-lock re-read, a co-owner maps ``three``.
+            if calls["n"] == 2:
+                cfg.write_text(
+                    json.dumps({"name": "victim", "resources": [self.ONE, self.TWO, self.THREE]})
+                )
+            return result
+
+        monkeypatch.setattr(agents_handlers, "_read_agent_spec", racing_read)
+
+        body = self._patch(["kiro-user/two", "kiro-user/one"])
+
+        landed = json.loads(cfg.read_text(encoding="utf-8"))["resources"]
+        assert landed == [self.TWO, self.ONE, self.THREE], landed
+        assert body["skills"] == [
+            "kiro-user/two",
+            "kiro-user/one",
+            "kiro-user/three",
+        ], f"the reply dropped a skill the written spec maps: {body!r}"
 
 
 class TestExtraSkillPathsAreAbsolute:
