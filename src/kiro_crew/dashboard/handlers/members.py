@@ -240,6 +240,25 @@ def _slot_has_unflushed_rows(slot: object) -> bool:
     )
 
 
+def _load_config_with_fingerprint() -> tuple[tuple, KiroCrewConfig]:
+    """The roster's config load, stamped with the files it was read from.
+
+    The stamp goes with the config into ``reconcile_member_config``, which is
+    what binds a correction to the config it was computed from. It is taken
+    BEFORE the read rather than after: a stamp taken afterwards could certify a
+    config that had already been replaced while the read was in flight. Stale in
+    the refusing direction only skips a correction the next roster read makes
+    again; stale in the accepting direction is the regression the stamp exists to
+    prevent.
+
+    One thread hop for both, so the stat pass does not land on the event loop.
+    """
+    from kiro_crew.config.loader import _config_fingerprint
+
+    fingerprint = _config_fingerprint()
+    return fingerprint, KiroCrewConfig.load()
+
+
 async def api_members(request: web.Request) -> web.Response:
     """GET /api/members — crew roster with DM binding and cheap live status.
 
@@ -254,7 +273,7 @@ async def api_members(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     state: DashboardState | None = request.app.get("state")
-    cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    config_fingerprint, cfg = await asyncio.to_thread(_load_config_with_fingerprint)
 
     # The roster's redaction chokepoint, shared with ``GET /api/agents`` so the
     # two endpoints cannot drift apart. Function-local for the same reason
@@ -541,7 +560,16 @@ async def api_members(request: web.Request) -> web.Response:
                 if agent_cfg is not None:
                     appended = (
                         eventlog_hooks.reconcile_member_config(
-                            slug, row["name"], agent_cfg, values.get("roster", {})
+                            slug,
+                            row["name"],
+                            agent_cfg,
+                            values.get("roster", {}),
+                            # The stamp of the config `agent_cfg` came from. This
+                            # read loads the config ONCE and projects every row
+                            # from it, so a save landing after that load leaves the
+                            # fold newer than what is held here; the stamp is what
+                            # lets the append refuse rather than regress it.
+                            config_fingerprint=config_fingerprint,
                         )
                         is not None
                     )
