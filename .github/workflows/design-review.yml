@@ -847,6 +847,73 @@ jobs:
             fi
             READ_FAILURE_NOTE="$subject exited $rc and reported: ${text:-(nothing on stderr)}"
           }
+          # A verdict this run computed and did NOT publish exists only inside this
+          # job. Nothing on the board retains it, because both carriers the board
+          # has are REPLACED rather than appended: the lane's marker comment is
+          # updated in place, so a later run's body takes this one's slot, and a
+          # check-run's conclusion and annotations are superseded by the next
+          # attempt's. A workflow artifact is neither -- it is written once under a
+          # name unique to this run and attempt, and no later run can rewrite it --
+          # so that is where a withheld verdict is kept.
+          #
+          # What this retains is the difference between "a verdict exists and did
+          # not reach its slot" and "no verdict was reached". Those two are
+          # indistinguishable on the board: an annotation can read like a published
+          # verdict while the write was refused, and a slot can be occupied by
+          # ANOTHER revision's verdict. So the receipt records the outcome and the
+          # head the verdict was computed for, beside the verdict text itself.
+          #
+          # The text comes from `body_file` when the caller named one, and otherwise
+          # off the write command this function was handed: a PATCH carries its body
+          # as a `body=` argument instead of a file, and a verdict retained without
+          # its text answers nothing a reader needs.
+          #
+          # This never changes what the caller sees. It runs only on the arms that
+          # already return a withheld status, returns 0 whatever it manages to
+          # write, and a retention that fails leaves the withhold reported exactly
+          # as it is reported today.
+          retain_unpublished_verdict() {
+            local rc="$1" body_file="$2" arg
+            local dir name now
+            shift 2
+            dir="${RUNNER_TEMP:-/tmp}/withheld-review-verdict"
+            # The head SHA leads the name so every record for one revision is
+            # reachable from the revision alone -- the pointer that cannot dangle,
+            # because it is derived rather than announced. Run id and attempt follow
+            # and make it unique, which is what lets a SECOND run on the same head
+            # add a record BESIDE the first instead of replacing it.
+            name="withheld-verdict-${HEAD}-${GITHUB_JOB:-job}-r${GITHUB_RUN_ID:-0}-a${GITHUB_RUN_ATTEMPT:-1}"
+            mkdir -p "$dir" || return 0
+            now="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo unknown)"
+            {
+              echo "outcome=withheld"
+              echo "head=$HEAD"
+              echo "write_rc=$rc"
+              echo "withheld_at=$now"
+              echo "repo=${REPO:-}"
+              echo "pr=${PR:-}"
+              echo "workflow=${GITHUB_WORKFLOW:-}"
+              echo "job=${GITHUB_JOB:-}"
+              echo "run_id=${GITHUB_RUN_ID:-}"
+              echo "run_attempt=${GITHUB_RUN_ATTEMPT:-}"
+              echo "artifact=$name"
+            } > "$dir/receipt.txt" || return 0
+            if [ -n "$body_file" ] && [ -f "$body_file" ]; then
+              cat "$body_file" > "$dir/verdict.md" || return 0
+            else
+              : > "$dir/verdict.md"
+              for arg in "$@"; do
+                case "$arg" in
+                  body=*)
+                    printf '%s\n' "${arg#body=}" > "$dir/verdict.md"
+                    break
+                    ;;
+                esac
+              done
+            fi
+            printf 'retained_verdict_artifact=%s\n' "$name" >> "${GITHUB_OUTPUT:-/dev/null}"
+            echo "::notice::This run computed a verdict for $HEAD and did NOT publish it (write status $rc). The verdict text is retained in workflow artifact $name, on run ${GITHUB_RUN_ID:-} attempt ${GITHUB_RUN_ATTEMPT:-}. An artifact named withheld-verdict-$HEAD... holds a verdict that EXISTS for this revision and never reached its comment slot, which is not the same as this revision having no verdict."
+          }
           retry_comment_write() {
             local slot="$1" needle="$2" body_file="$3" target="$4"
             local attempt landed head_now ov_body
@@ -906,6 +973,7 @@ jobs:
               if [ -z "$slot_ok" ]; then
                 note_read_failure "$slot_rc" "reading this PR's comments to find this lane's slot" "$READ_ERR_FILE"
                 echo "Whether this lane's slot is already taken is unreadable after 6 attempts, so nothing was posted: re-running this lane publishes the verdict, and a second comment in the slot does not come back out without a human."
+                retain_unpublished_verdict 1 "$body_file" "$@"
                 return 1
               fi
               if [ -n "$occupied" ]; then
@@ -941,6 +1009,7 @@ jobs:
                 # the lane publishes it once the slot is current. Status 2 is
                 # that case specifically, so no caller can read it as a write.
                 echo "Comment #$slot_id already holds this lane's slot, so this run wrote NOTHING: a second comment beside it is the one a later override cannot reach, and overwriting it can discard a verdict for a head this run cannot judge. Re-run this lane once that comment is no longer current."
+                retain_unpublished_verdict 2 "$body_file" "$@"
                 return 2
               fi
             fi
@@ -949,6 +1018,7 @@ jobs:
                 return 0
               fi
               echo "This body carries no current-head stamp, so a lost write cannot be told from a rejected one; not posting again."
+              retain_unpublished_verdict 1 "$body_file" "$@"
               return 1
             fi
             for attempt in 1 2 3 4 5 6; do
@@ -966,6 +1036,7 @@ jobs:
                 if [ "$slot_rc" -ne 0 ]; then
                   note_read_failure "$slot_rc" "re-reading this PR's comments to confirm whether the previous write landed" "$READ_ERR_FILE"
                   echo "Cannot confirm whether the previous attempt landed, so not posting again."
+                  retain_unpublished_verdict 1 "$body_file" "$@"
                   return 1
                 fi
                 if [ -n "$landed" ]; then
@@ -975,6 +1046,7 @@ jobs:
                     return 0
                   fi
                   echo "Comment #$(printf '%s\n' "$landed" | awk 'NR == 1 { print $1 }') took this lane's slot while this run was retrying, and it is not this run's write, so this run wrote NOTHING: overwriting it would discard a verdict for another head, and posting beside it leaves a comment a later override cannot reach."
+                  retain_unpublished_verdict 2 "$body_file" "$@"
                   return 2
                 fi
               fi
@@ -1004,6 +1076,7 @@ jobs:
                 if ! head_now="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null)" \
                   || [ -z "$head_now" ]; then
                   echo "Whether $HEAD is still this PR's head is unreadable, so this write was not repeated: a repeat can replace a newer head's verdict with a superseded one. Re-run this lane to publish this verdict."
+                  retain_unpublished_verdict 1 "$body_file" "$@"
                   return 1
                 fi
                 if [ "$head_now" != "$HEAD" ]; then
@@ -1032,6 +1105,7 @@ jobs:
                   if [ "$ov_rc" -ne 0 ]; then
                     note_read_failure "$ov_rc" "reading the comment this repeat would overwrite, to check for an accepted human override" "$READ_ERR_FILE"
                     echo "Comment #$target could not be read, so this write was not repeated: a repeat can restore a body over a human decision. Re-run this lane to publish this verdict."
+                    retain_unpublished_verdict 1 "$body_file" "$@"
                     return 1
                   fi
                   case "$ov_body" in
@@ -1050,6 +1124,7 @@ jobs:
                 sleep "$(( attempt * 5 ))"
               fi
             done
+            retain_unpublished_verdict 1 "$body_file" "$@"
             return 1
           }
           # Guarded upsert (#8292, #8344): the shared function below is defined
@@ -1226,6 +1301,38 @@ jobs:
       # below is exactly BLOCK -- an errored or overloaded review exits 0, so
       # infrastructure noise can never block a merge. Do NOT widen the failing
       # branch beyond BLOCK.
+      # Where a withheld verdict goes, so that it outlives the job that computed
+      # it. The step above reports a withheld verdict in an annotation, and an
+      # annotation is replaced by the next attempt's -- as is the marker comment
+      # it could not write into. An artifact is replaced by neither.
+      #
+      # It runs only when that step actually withheld one. The output it reads is
+      # written at the moment of withholding and nowhere else, so a published
+      # verdict uploads nothing, and a lane that reached no verdict at all leaves
+      # no record that could be mistaken for one. That is the distinction this
+      # exists to keep: a verdict that EXISTS and never reached its slot is not
+      # the same as no verdict, and on the board the two look alike.
+      #
+      # `error` rather than `ignore` on missing files: the output is set by the
+      # same code that writes the files, so an empty directory here is a fault in
+      # this mechanism and must be loud rather than silently produce no record.
+      - name: Retain this run's unpublished verdict
+        if: >-
+          github.event.pull_request.head.repo.full_name == github.repository
+          && (
+          always()
+          && steps.post.outputs.retained_verdict_artifact != ''
+          )
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          # Named by the publish step: the head SHA leads, so every record for
+          # one revision is reachable from the revision alone, and the run and
+          # attempt follow, so a SECOND run on the same head adds its record
+          # beside the first instead of overwriting it.
+          name: ${{ steps.post.outputs.retained_verdict_artifact }}
+          path: ${{ runner.temp }}/withheld-review-verdict
+          if-no-files-found: error
+          retention-days: 7
       - name: Design review status (gates on BLOCK)
         if: >-
           github.event.pull_request.head.repo.full_name == github.repository
