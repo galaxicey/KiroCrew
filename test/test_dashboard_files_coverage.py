@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import sys
@@ -1429,6 +1430,50 @@ class TestDashboardConfigPut:
             got = await (await client.get("/api/dashboard/config")).json()
         for key, want in payload.items():
             assert got[key] == want, key
+
+    @pytest.mark.asyncio
+    async def test_default_memory_mode_forced_is_read_only_and_round_trips(
+        self, config_client_app
+    ):
+        """The GET carries the loader's forced flag; a spread-back PUT must not 400."""
+        async with TestClient(TestServer(config_client_app)) as client:
+            got = await (await client.get("/api/dashboard/config")).json()
+            assert got["default_memory_mode_forced"] is False
+            resp = await client.put(
+                "/api/dashboard/config",
+                json={**got, "default_memory_mode_forced": True, "quick_send": True},
+            )
+            assert resp.status == 200, await resp.text()
+            again = await (await client.get("/api/dashboard/config")).json()
+            # Read-only: the client cannot set it, only the loader can.
+            assert again["default_memory_mode_forced"] is False
+            assert again["quick_send"] is True
+
+    @pytest.mark.asyncio
+    async def test_switching_default_to_non_persistent_is_logged(
+        self, config_client_app, caplog
+    ):
+        """Settings choosing incognito/temporary is said in the gateway log too,
+        once per change -- saving another toggle afterwards repeats nothing."""
+        needle = "Default memory mode for new dashboard chats set to"
+        async with TestClient(TestServer(config_client_app)) as client:
+            with caplog.at_level(logging.WARNING, logger=files_mod.logger.name):
+                resp = await client.put(
+                    "/api/dashboard/config", json={"default_memory_mode": "temporary"}
+                )
+                assert resp.status == 200
+                resp = await client.put(
+                    "/api/dashboard/config",
+                    json={"default_memory_mode": "temporary", "quick_send": True},
+                )
+                assert resp.status == 200
+                resp = await client.put(
+                    "/api/dashboard/config", json={"default_memory_mode": "persistent"}
+                )
+                assert resp.status == 200
+        hits = [r.getMessage() for r in caplog.records if needle in r.getMessage()]
+        assert len(hits) == 1
+        assert "'temporary'" in hits[0] and "not written to disk" in hits[0]
 
     @pytest.mark.asyncio
     async def test_cancellation_mid_load_is_still_audited(self, mock_sel):

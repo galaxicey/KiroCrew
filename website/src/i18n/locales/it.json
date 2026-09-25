@@ -8516,7 +8516,7 @@
     "welcomeView": {
       "autopilot": "Pilota automatico",
       "incognito": "Incognito",
-      "incognito_desc": "Usa la memoria esistente, ma non apprende lezioni. Conserva la trascrizione per ripristinare la scheda.",
+      "incognito_desc": "Usa la memoria esistente, ma non apprende lezioni. Non viene salvato: la trascrizione esiste solo mentre {{productName}} è in esecuzione e scompare dopo un riavvio o un aggiornamento.",
       "refresh_suggestions": "Aggiorna i suggerimenti",
       "simple_tasks_run_instantly_complex_ones_get_a_pl": "Le attività semplici vengono eseguite subito. Per quelle complesse viene proposto un piano che approvi prima.",
       "suggestion_pipeline_status": "Controlla lo stato della mia pipeline",
@@ -8529,7 +8529,7 @@
       "incognito_active_switch_to_persistent": "Incognito — passa alla modalità persistente",
       "temporary": "Temporaneo",
       "temporary_active_switch_to_persistent": "Temporaneo — passa alla modalità persistente",
-      "temporary_desc": "Non usa la memoria e non apprende lezioni. Conserva la trascrizione per ripristinare la scheda.",
+      "temporary_desc": "Non usa la memoria e non apprende lezioni. Non viene salvato: la trascrizione esiste solo mentre {{productName}} è in esecuzione e scompare dopo un riavvio o un aggiornamento.",
       "try_create_a_plan_to_analyze_kirocrew_code_packa": "Prova: \"Crea un piano per analizzare il pacchetto di codice di {{productName}} e riportare il numero di file per componenti principali\"",
       "what_can_i_do_for_you": "Cosa posso fare per te?"
     },
@@ -8971,6 +8971,11 @@
       "unexpected_response": "Risposta inaspettata",
       "deploy_failed": "Deploy non riuscito",
       "stale_preview_retry": "L’app è cambiata dopo il controllo — riprova."
+    },
+    "unsavedDefaultNotice": {
+      "config_unreadable_forced_temporary": "Impossibile leggere config.json, quindi le nuove chat usano la modalità Temporaneo finché il file non viene corretto e {{productName}} riavviato. La trascrizione di una chat Temporaneo esiste solo mentre {{productName}} è in esecuzione e scompare dopo un riavvio o un aggiornamento.",
+      "new_chats_are_not_being_saved": "Le nuove chat non vengono salvate",
+      "open_chat_settings": "Apri le impostazioni della chat"
     }
   },
   "hooks": {
@@ -16436,9 +16441,11 @@
   "settings": {
     "chat": {
       "defaultMemoryMode": {
-        "description": "Persistente usa ciò che già sa e salva nuova memoria. Incognito usa ciò che sa, ma non salva nuova memoria. Temporaneo parte senza memoria e non salva nulla. Tutte le chat restano visibili nella cronologia. Puoi cambiare la modalità di ogni chat.",
+        "description": "Persistente usa ciò che già sa, salva nuova memoria e mantiene ogni chat nella cronologia. Incognito usa ciò che sa, ma non salva nuova memoria. Temporaneo parte senza memoria e non salva nulla. Le chat Incognito e Temporaneo non vengono salvate: nulla viene scritto su disco, quindi scompaiono dopo un riavvio o un aggiornamento. Puoi cambiare la modalità di ogni chat.",
+        "forced_notice": "Impossibile leggere config.json, quindi le nuove chat usano la modalità Temporaneo finché il file non viene corretto e {{productName}} riavviato. Le chat Temporaneo non vengono salvate: scompaiono dopo un riavvio o un aggiornamento.",
         "label": "Modalità memoria predefinita",
-        "persistent": "Persistente"
+        "persistent": "Persistente",
+        "unsaved_notice": "Le nuove chat non verranno salvate: la loro trascrizione scompare dopo un riavvio o un aggiornamento."
       },
       "plainDiff": {
         "description": "Mostra i diff come testo unified diff senza evidenziazione della sintassi. Usa meno memoria sui diff di grandi dimensioni.",

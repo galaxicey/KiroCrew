@@ -6509,7 +6509,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
         # PUT body. Drop them here instead of listing them in _allowed -- they
         # stay unwritable, but a round-tripped read-only field must not 400 an
         # unrelated toggle save.
-        read_only_ignored_keys = {"gitlab_hosts", "jira_hosts", "social_share_enabled", "decisions_enabled", "model_picker_hidden_models", "model_picker_configured"}
+        read_only_ignored_keys = {"gitlab_hosts", "jira_hosts", "social_share_enabled", "decisions_enabled", "model_picker_hidden_models", "model_picker_configured", "default_memory_mode_forced"}
         body = {
             k: v
             for k, v in body.items()
@@ -6930,6 +6930,22 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
         _sel().log_tool_invocation(
             session_key="dashboard", tool_name="dashboard_config_write", outcome="success"
         )
+        new_default_mode = updates.get("default_memory_mode")
+        if (
+            isinstance(new_default_mode, str)
+            and new_default_mode != "persistent"
+            and new_default_mode != cfg.dashboard.default_memory_mode
+        ):
+            # Said in the gateway log as well as in Settings: from here on every
+            # new dashboard chat keeps its transcript only in the running process,
+            # and the person reading this log after a restart wiped a chat is the
+            # one who needs the line.
+            logger.warning(
+                "Default memory mode for new dashboard chats set to %r: their "
+                "transcript is not written to disk and is lost when the gateway "
+                "restarts or upgrades.",
+                new_default_mode,
+            )
         chips_written = updates.get("session_card_source_links")
         if isinstance(chips_written, bool):
             # Publish the new value NOW instead of leaving it to the next
@@ -6986,6 +7002,11 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             "restore_window_minutes": cfg.dashboard.restore_window_minutes,
             "merge_queued_messages": cfg.dashboard.merge_queued_messages,
             "default_memory_mode": cfg.dashboard.default_memory_mode,
+            # Read-only: true when the loader forced the default to Temporary
+            # because config.json (or its dashboard section) could not be read.
+            # The dashboard renders a different notice for that case -- it names
+            # a file to fix, where the operator's own choice names nothing.
+            "default_memory_mode_forced": cfg.default_memory_mode_forced,
             "widget_density": cfg.dashboard.widget_density,
             "use_builtin_browser": cfg.dashboard.use_builtin_browser,
             "verbosity": cfg.dashboard.verbosity,

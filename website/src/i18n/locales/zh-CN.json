@@ -8282,7 +8282,7 @@
     "welcomeView": {
       "autopilot": "自动驾驶",
       "incognito": "隐身",
-      "incognito_desc": "使用现有记忆，但不会学习新经验。保留聊天记录以便恢复标签页。",
+      "incognito_desc": "使用现有记忆，但不会学习新经验。不会保存：聊天记录只在 {{productName}} 运行期间存在，重启或升级后即丢失。",
       "refresh_suggestions": "刷新建议",
       "simple_tasks_run_instantly_complex_ones_get_a_pl": "简单任务立即执行。复杂任务会先生成计划供你审批。",
       "suggestion_pipeline_status": "查看我的流水线状态",
@@ -8295,7 +8295,7 @@
       "incognito_active_switch_to_persistent": "隐身 — 切换到持久模式",
       "temporary": "临时",
       "temporary_active_switch_to_persistent": "临时 — 切换到持久模式",
-      "temporary_desc": "不使用记忆，也不会学习新经验。保留聊天记录以便恢复标签页。",
+      "temporary_desc": "不使用记忆，也不会学习新经验。不会保存：聊天记录只在 {{productName}} 运行期间存在，重启或升级后即丢失。",
       "try_create_a_plan_to_analyze_kirocrew_code_packa": "试试：“制定一个计划，分析 {{productName}} 代码包并按主要组件报告文件数”",
       "what_can_i_do_for_you": "我能帮你做什么？"
     },
@@ -8733,6 +8733,11 @@
       "unexpected_response": "意外的响应",
       "deploy_failed": "部署失败",
       "stale_preview_retry": "检查后应用已更改 — 请重试。"
+    },
+    "unsavedDefaultNotice": {
+      "config_unreadable_forced_temporary": "无法读取 config.json，因此新聊天默认为临时模式，直到修复该文件并重启 {{productName}}。临时聊天的记录只在 {{productName}} 运行期间存在，重启或升级后即丢失。",
+      "new_chats_are_not_being_saved": "新聊天未被保存",
+      "open_chat_settings": "打开聊天设置"
     }
   },
   "hooks": {
@@ -15996,9 +16001,11 @@
   "settings": {
     "chat": {
       "defaultMemoryMode": {
-        "description": "持久模式会使用已知信息并保存新记忆。隐身模式会使用已知信息，但不保存新记忆。临时模式从空白开始，不保存任何记忆。所有聊天仍会显示在历史记录中。你可以更改任意聊天的模式。",
+        "description": "持久模式会使用已知信息、保存新记忆，并把每个聊天保留在历史记录中。隐身模式会使用已知信息，但不保存新记忆。临时模式从空白开始，不保存任何记忆。隐身和临时聊天不会保存：不会写入磁盘，重启或升级后即丢失。你可以更改任意聊天的模式。",
+        "forced_notice": "无法读取 config.json，因此新聊天默认为临时模式，直到修复该文件并重启 {{productName}}。临时聊天不会保存：重启或升级后即丢失。",
         "label": "默认记忆模式",
-        "persistent": "持久"
+        "persistent": "持久",
+        "unsaved_notice": "新聊天不会被保存：聊天记录在重启或升级后即丢失。"
       },
       "plainDiff": {
         "description": "以普通 unified diff 文本显示差异，不使用语法高亮着色。在大型差异上占用更少内存。",

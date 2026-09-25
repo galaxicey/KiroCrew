@@ -886,7 +886,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.default-memory-mode",
     "label": "Default Memory Mode",
     "labelKey": "settings.chat.defaultMemoryMode.label",
-    "description": "Persistent uses what it knows and saves new memory. Incognito uses what it knows but saves no new memory. Temporary starts blank and saves no new memory. Every chat still appears in History. You can change the mode for any chat.",
+    "description": "Persistent uses what it knows, saves new memory and keeps every chat in History. Incognito uses what it knows but saves no new memory. Temporary starts blank and saves no new memory. Incognito and Temporary chats are not saved: nothing is written to disk, so they are gone after a restart or upgrade. You can change the mode for any chat.",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,

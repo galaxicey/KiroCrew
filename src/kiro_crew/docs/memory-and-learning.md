@@ -84,11 +84,16 @@ Lessons have two scopes:
 
 Each session can operate in one of three memory modes:
 
-| Mode | Reads Memory | Writes Memory | Consolidates | Use Case |
-|------|-------------|---------------|-------------|----------|
-| **Persistent** (factory default) | ✅ | ✅ | ✅ | Normal work |
-| **Incognito** | ✅ | ❌ | ❌ | Sensitive tasks — reads context but blocks learn_add and consolidation |
-| **Temporary** | ❌ | ❌ | ❌ | Isolated experiments — no memory interaction at all |
+| Mode | Reads Memory | Writes Memory | Consolidates | Transcript on disk | Use Case |
+|------|-------------|---------------|-------------|--------------------|----------|
+| **Persistent** (factory default) | ✅ | ✅ | ✅ | ✅ survives restart, listed in History | Normal work |
+| **Incognito** | ✅ | ❌ | ❌ | ❌ gone after a gateway restart or upgrade | Sensitive tasks — reads context but blocks learn_add and consolidation |
+| **Temporary** | ❌ | ❌ | ❌ | ❌ gone after a gateway restart or upgrade | Isolated experiments — no memory interaction at all |
+
+> **Incognito and Temporary dashboard chats are not saved.** Their transcript
+> lives only in the running gateway: nothing is written to disk and nothing is
+> learned, so the chat is gone after a gateway restart or upgrade and never
+> appears in History. Keep a chat you want to come back to in Persistent.
 
 For new dashboard chats, choose the default under **Settings → Chat → Sessions →
 Default Memory Mode**. The choice is stored as
@@ -96,7 +101,9 @@ Default Memory Mode**. The choice is stored as
 wins for that chat. App-owned chats, messaging channels, cron jobs, and direct API
 callers keep their own mode selection and do not inherit this dashboard preference.
 If `config.json` or its `dashboard` section cannot be read, new chats fail closed
-to Temporary until the file is fixed and the gateway restarts.
+to Temporary until the file is fixed and the gateway restarts; the gateway logs
+one warning saying so, and Settings shows the same notice under Default Memory
+Mode while the default is non-persistent for either reason.
 
 Set via the dashboard Welcome view (ghost button), the mode icon in the chat
 header, Slack (`!incognito` / `!temporary` prefix), or Telegram (`/incognito` /

@@ -8516,7 +8516,7 @@
     "welcomeView": {
       "autopilot": "Autopilote",
       "incognito": "Incognito",
-      "incognito_desc": "Utilise la mémoire existante, mais n’apprend aucune leçon. Conserve la transcription pour restaurer l’onglet.",
+      "incognito_desc": "Utilise la mémoire existante, mais n’apprend aucune leçon. Non enregistré : la transcription n’existe que pendant que {{productName}} tourne et disparaît après un redémarrage ou une mise à jour.",
       "refresh_suggestions": "Actualiser les suggestions",
       "simple_tasks_run_instantly_complex_ones_get_a_pl": "Les tâches simples s'exécutent immédiatement. Les tâches complexes reçoivent un plan que vous approuvez d'abord.",
       "suggestion_pipeline_status": "Vérifier l'état de mon pipeline",
@@ -8529,7 +8529,7 @@
       "incognito_active_switch_to_persistent": "Incognito — passer au mode persistant",
       "temporary": "Temporaire",
       "temporary_active_switch_to_persistent": "Temporaire — passer au mode persistant",
-      "temporary_desc": "N’utilise pas la mémoire et n’apprend aucune leçon. Conserve la transcription pour restaurer l’onglet.",
+      "temporary_desc": "N’utilise pas la mémoire et n’apprend aucune leçon. Non enregistré : la transcription n’existe que pendant que {{productName}} tourne et disparaît après un redémarrage ou une mise à jour.",
       "try_create_a_plan_to_analyze_kirocrew_code_packa": "Essayez : « Crée un plan pour analyser le package de code {{productName}} et indiquer le nombre de fichiers par composant principal »",
       "what_can_i_do_for_you": "Que puis-je faire pour toi ?"
     },
@@ -8971,6 +8971,11 @@
       "unexpected_response": "Réponse inattendue",
       "deploy_failed": "Échec du déploiement",
       "stale_preview_retry": "L’application a changé depuis la vérification — réessaie."
+    },
+    "unsavedDefaultNotice": {
+      "config_unreadable_forced_temporary": "config.json n’a pas pu être lu, les nouveaux chats passent donc en mode Temporaire jusqu’à ce que le fichier soit corrigé et que {{productName}} redémarre. La transcription d’un chat Temporaire n’existe que pendant que {{productName}} tourne et disparaît après un redémarrage ou une mise à jour.",
+      "new_chats_are_not_being_saved": "Les nouveaux chats ne sont pas enregistrés",
+      "open_chat_settings": "Ouvrir les paramètres du chat"
     }
   },
   "hooks": {
@@ -16436,9 +16441,11 @@
   "settings": {
     "chat": {
       "defaultMemoryMode": {
-        "description": "Persistant utilise ce qu’il sait déjà et enregistre de nouveaux souvenirs. Incognito utilise ce qu’il sait, mais n’enregistre rien de nouveau. Temporaire démarre sans mémoire et n’enregistre rien. Tous les chats restent visibles dans l’historique. Vous pouvez changer le mode de chaque chat.",
+        "description": "Persistant utilise ce qu’il sait déjà, enregistre de nouveaux souvenirs et garde chaque chat dans l’historique. Incognito utilise ce qu’il sait, mais n’enregistre rien de nouveau. Temporaire démarre sans mémoire et n’enregistre rien. Les chats Incognito et Temporaire ne sont pas enregistrés : rien n’est écrit sur le disque, ils disparaissent donc après un redémarrage ou une mise à jour. Tu peux changer le mode de chaque chat.",
+        "forced_notice": "config.json n’a pas pu être lu, les nouveaux chats passent donc en mode Temporaire jusqu’à ce que le fichier soit corrigé et que {{productName}} redémarre. Les chats Temporaire ne sont pas enregistrés : ils disparaissent après un redémarrage ou une mise à jour.",
         "label": "Mode mémoire par défaut",
-        "persistent": "Persistant"
+        "persistent": "Persistant",
+        "unsaved_notice": "Les nouveaux chats ne seront pas enregistrés : leur transcription disparaît après un redémarrage ou une mise à jour."
       },
       "plainDiff": {
         "description": "Affiche les diffs sous forme de texte unified diff sans coloration syntaxique. Consomme moins de mémoire sur les diffs volumineux.",

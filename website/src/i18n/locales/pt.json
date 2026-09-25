@@ -8516,7 +8516,7 @@
     "welcomeView": {
       "autopilot": "Autopilot",
       "incognito": "Anônimo",
-      "incognito_desc": "Usa a memória existente, mas não aprende lições. Mantém a transcrição para recuperar a aba.",
+      "incognito_desc": "Usa a memória existente, mas não aprende lições. Não é salvo: a transcrição existe apenas enquanto o {{productName}} está em execução e desaparece após reiniciar ou atualizar.",
       "refresh_suggestions": "Atualizar sugestões",
       "simple_tasks_run_instantly_complex_ones_get_a_pl": "Tarefas simples são executadas na hora. As complexas geram um plano que você aprova primeiro.",
       "suggestion_pipeline_status": "Verificar o status do meu pipeline",
@@ -8529,7 +8529,7 @@
       "incognito_active_switch_to_persistent": "Anônimo — mudar para o modo persistente",
       "temporary": "Temporário",
       "temporary_active_switch_to_persistent": "Temporário — mudar para o modo persistente",
-      "temporary_desc": "Não usa memória nem aprende lições. Mantém a transcrição para recuperar a aba.",
+      "temporary_desc": "Não usa memória nem aprende lições. Não é salvo: a transcrição existe apenas enquanto o {{productName}} está em execução e desaparece após reiniciar ou atualizar.",
       "try_create_a_plan_to_analyze_kirocrew_code_packa": "Tente: “Crie um plano para analisar o pacote de código do {{productName}} e informar a contagem de arquivos por componente principal”",
       "what_can_i_do_for_you": "O que posso fazer por você?"
     },
@@ -8971,6 +8971,11 @@
       "unexpected_response": "Resposta inesperada",
       "deploy_failed": "Falha ao implantar",
       "stale_preview_retry": "O app mudou desde a verificação — tente novamente."
+    },
+    "unsavedDefaultNotice": {
+      "config_unreadable_forced_temporary": "Não foi possível ler config.json, então os novos chats usam o modo Temporário até o arquivo ser corrigido e o {{productName}} reiniciar. A transcrição de um chat Temporário existe apenas enquanto o {{productName}} está em execução e desaparece após reiniciar ou atualizar.",
+      "new_chats_are_not_being_saved": "Os novos chats não estão sendo salvos",
+      "open_chat_settings": "Abrir configurações do chat"
     }
   },
   "hooks": {
@@ -16436,9 +16441,11 @@
   "settings": {
     "chat": {
       "defaultMemoryMode": {
-        "description": "Persistente usa o que já sabe e salva nova memória. Anônimo usa o que sabe, mas não salva nova memória. Temporário começa em branco e não salva nada. Todos os chats continuam aparecendo no histórico. Você pode mudar o modo de qualquer chat.",
+        "description": "Persistente usa o que já sabe, salva nova memória e mantém cada chat no histórico. Anônimo usa o que sabe, mas não salva nova memória. Temporário começa em branco e não salva nada. Os chats Anônimo e Temporário não são salvos: nada é gravado em disco, então eles desaparecem após reiniciar ou atualizar. Você pode mudar o modo de qualquer chat.",
+        "forced_notice": "Não foi possível ler config.json, então os novos chats usam o modo Temporário até o arquivo ser corrigido e o {{productName}} reiniciar. Os chats Temporário não são salvos: eles desaparecem após reiniciar ou atualizar.",
         "label": "Modo de memória padrão",
-        "persistent": "Persistente"
+        "persistent": "Persistente",
+        "unsaved_notice": "Os novos chats não serão salvos: a transcrição deles desaparece após reiniciar ou atualizar."
       },
       "plainDiff": {
         "description": "Exibe os diffs como texto unified diff sem realce de sintaxe. Usa menos memória em diffs grandes.",

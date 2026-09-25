@@ -8516,7 +8516,7 @@
     "welcomeView": {
       "autopilot": "Piloto automático",
       "incognito": "Incógnito",
-      "incognito_desc": "Usa la memoria existente, pero no aprende lecciones. Conserva la transcripción para recuperar la pestaña.",
+      "incognito_desc": "Usa la memoria existente, pero no aprende lecciones. No se guarda: la transcripción existe solo mientras {{productName}} está en ejecución y desaparece tras un reinicio o una actualización.",
       "refresh_suggestions": "Actualizar sugerencias",
       "simple_tasks_run_instantly_complex_ones_get_a_pl": "Las tareas simples se ejecutan al instante. Las complejas generan un plan que apruebas primero.",
       "suggestion_pipeline_status": "Consultar el estado de mi pipeline",
@@ -8529,7 +8529,7 @@
       "incognito_active_switch_to_persistent": "Incógnito — cambiar al modo persistente",
       "temporary": "Temporal",
       "temporary_active_switch_to_persistent": "Temporal — cambiar al modo persistente",
-      "temporary_desc": "No usa la memoria ni aprende lecciones. Conserva la transcripción para recuperar la pestaña.",
+      "temporary_desc": "No usa la memoria ni aprende lecciones. No se guarda: la transcripción existe solo mientras {{productName}} está en ejecución y desaparece tras un reinicio o una actualización.",
       "try_create_a_plan_to_analyze_kirocrew_code_packa": "Prueba: “Crea un plan para analizar el paquete de código de {{productName}} e informar del número de archivos por componentes principales”",
       "what_can_i_do_for_you": "¿Qué puedo hacer por ti?"
     },
@@ -8971,6 +8971,11 @@
       "unexpected_response": "Respuesta inesperada",
       "deploy_failed": "Error al desplegar",
       "stale_preview_retry": "La aplicación cambió desde la comprobación — inténtalo de nuevo."
+    },
+    "unsavedDefaultNotice": {
+      "config_unreadable_forced_temporary": "No se pudo leer config.json, así que los chats nuevos usan el modo Temporal hasta que se corrija el archivo y {{productName}} se reinicie. La transcripción de un chat Temporal existe solo mientras {{productName}} está en ejecución y desaparece tras un reinicio o una actualización.",
+      "new_chats_are_not_being_saved": "Los chats nuevos no se están guardando",
+      "open_chat_settings": "Abrir ajustes de chat"
     }
   },
   "hooks": {
@@ -16436,9 +16441,11 @@
   "settings": {
     "chat": {
       "defaultMemoryMode": {
-        "description": "Persistente usa lo que ya sabe y guarda memoria nueva. Incógnito usa lo que sabe, pero no guarda memoria nueva. Temporal empieza en blanco y no guarda memoria. Todos los chats siguen apareciendo en el historial. Puedes cambiar el modo de cualquier chat.",
+        "description": "Persistente usa lo que ya sabe, guarda memoria nueva y mantiene cada chat en el historial. Incógnito usa lo que sabe, pero no guarda memoria nueva. Temporal empieza en blanco y no guarda memoria. Los chats Incógnito y Temporal no se guardan: no se escribe nada en disco, así que desaparecen tras un reinicio o una actualización. Puedes cambiar el modo de cualquier chat.",
+        "forced_notice": "No se pudo leer config.json, así que los chats nuevos usan el modo Temporal hasta que se corrija el archivo y {{productName}} se reinicie. Los chats Temporal no se guardan: desaparecen tras un reinicio o una actualización.",
         "label": "Modo de memoria predeterminado",
-        "persistent": "Persistente"
+        "persistent": "Persistente",
+        "unsaved_notice": "Los chats nuevos no se guardarán: su transcripción desaparece tras un reinicio o una actualización."
       },
       "plainDiff": {
         "description": "Muestra los diffs como texto unified diff sin resaltado de sintaxis. Usa menos memoria en diffs grandes.",

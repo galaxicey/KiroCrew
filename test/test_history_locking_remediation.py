@@ -1245,6 +1245,9 @@ class TestOnLoopCallersOffload:
         slot._title_refresh_mark = 8
         slot._title_low_signal = False
         slot._title_epoch = 0
+        # Declared, not left to the mock: a MagicMock attribute is truthy, and the
+        # restricted branch takes ``update_metadata_if`` instead.
+        slot.is_restricted = False
 
         asyncio.run(chat_title._persist_title(state, slot))
 
@@ -1252,6 +1255,50 @@ class TestOnLoopCallersOffload:
         assert seen["thread"] != loop_thread, "update_metadata ran on the event loop thread"
         persisted = ConversationLog(base_dir=tmp_path).get_metadata("dashboard:t")
         assert persisted["title"] == "My Title"
+
+    def test_persist_title_restricted_runs_update_metadata_if_off_loop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The restricted branch enters ``_locked`` too, through ``update_metadata_if``."""
+        import asyncio
+        import threading
+        from unittest.mock import MagicMock
+
+        from kiro_crew.dashboard import chat_title
+
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("dashboard:t", "user", "seed")
+        log.update_metadata("dashboard:t", {"memory_mode": "incognito"})
+
+        loop_thread = threading.get_ident()
+        seen: dict[str, int] = {}
+        real_update_metadata_if = log.update_metadata_if
+
+        def _spy(*args: object, **kwargs: object) -> bool:
+            seen["thread"] = threading.get_ident()
+            return real_update_metadata_if(*args, **kwargs)  # type: ignore[arg-type]
+
+        log.update_metadata_if = _spy  # type: ignore[method-assign]
+        monkeypatch.setattr(chat_title, "slot_history_key", lambda _slot: "dashboard:t")
+
+        state = MagicMock()
+        state.conversation_log = log
+        slot = MagicMock()
+        slot.key = "t"
+        slot.title = "My Title"
+        slot._title_origin = "auto"
+        slot._title_refresh_mark = 8
+        slot._title_low_signal = False
+        slot._title_epoch = 0
+        slot.is_restricted = True
+
+        asyncio.run(chat_title._persist_title(state, slot))
+
+        assert seen.get("thread") is not None
+        assert seen["thread"] != loop_thread, "update_metadata_if ran on the event loop thread"
+        persisted = ConversationLog(base_dir=tmp_path).get_metadata("dashboard:t")
+        assert persisted["title"] == "My Title"
+        assert persisted["memory_mode"] == "incognito"
         # Provenance + consumed refresh milestone are persisted alongside the
         # title so "a rename is final" and the refresh token budget survive a
         # reload.

@@ -8399,7 +8399,7 @@
     "welcomeView": {
       "autopilot": "Autopilot",
       "incognito": "Inkognito",
-      "incognito_desc": "Nutzt vorhandene Erinnerungen, lernt aber keine Lektionen. Speichert den Chatverlauf zur Wiederherstellung des Tabs.",
+      "incognito_desc": "Nutzt vorhandene Erinnerungen, lernt aber keine Lektionen. Wird nicht gespeichert: Der Chatverlauf existiert nur, solange {{productName}} läuft, und ist nach einem Neustart oder Update weg.",
       "refresh_suggestions": "Vorschläge aktualisieren",
       "simple_tasks_run_instantly_complex_ones_get_a_pl": "Einfache Aufgaben laufen sofort. Für komplexe gibt es einen Plan, den Sie zuerst genehmigen.",
       "suggestion_pipeline_status": "Meinen Pipeline-Status prüfen",
@@ -8412,7 +8412,7 @@
       "incognito_active_switch_to_persistent": "Inkognito — zum dauerhaften Modus wechseln",
       "temporary": "Temporär",
       "temporary_active_switch_to_persistent": "Temporär — zum dauerhaften Modus wechseln",
-      "temporary_desc": "Verwendet keine Erinnerungen und lernt keine Lektionen. Speichert den Chatverlauf zur Wiederherstellung des Tabs.",
+      "temporary_desc": "Verwendet keine Erinnerungen und lernt keine Lektionen. Wird nicht gespeichert: Der Chatverlauf existiert nur, solange {{productName}} läuft, und ist nach einem Neustart oder Update weg.",
       "try_create_a_plan_to_analyze_kirocrew_code_packa": "Versuchen Sie: „Erstelle einen Plan, um das {{productName}}-Codepaket zu analysieren und die Dateianzahl nach Hauptkomponenten zu melden“",
       "what_can_i_do_for_you": "Was kann ich für dich tun?"
     },
@@ -8852,6 +8852,11 @@
       "unexpected_response": "Unerwartete Antwort",
       "deploy_failed": "Bereitstellung fehlgeschlagen",
       "stale_preview_retry": "Die App hat sich seit der Prüfung geändert — versuche es erneut."
+    },
+    "unsavedDefaultNotice": {
+      "config_unreadable_forced_temporary": "config.json konnte nicht gelesen werden, deshalb starten neue Chats im Modus Temporär, bis die Datei repariert und {{productName}} neu gestartet ist. Der Verlauf eines Temporär-Chats existiert nur, solange {{productName}} läuft, und ist nach einem Neustart oder Update weg.",
+      "new_chats_are_not_being_saved": "Neue Chats werden nicht gespeichert",
+      "open_chat_settings": "Chat-Einstellungen öffnen"
     }
   },
   "hooks": {
@@ -16216,9 +16221,11 @@
   "settings": {
     "chat": {
       "defaultMemoryMode": {
-        "description": "Dauerhaft nutzt vorhandenes Wissen und speichert neue Erinnerungen. Inkognito nutzt vorhandenes Wissen, speichert aber nichts Neues. Temporär startet ohne Vorwissen und speichert nichts. Jeder Chat bleibt im Verlauf sichtbar. Du kannst den Modus für jeden Chat ändern.",
+        "description": "Dauerhaft nutzt vorhandenes Wissen, speichert neue Erinnerungen und behält jeden Chat im Verlauf. Inkognito nutzt vorhandenes Wissen, speichert aber nichts Neues. Temporär startet ohne Vorwissen und speichert nichts. Inkognito- und Temporär-Chats werden nicht gespeichert: Nichts wird auf die Festplatte geschrieben, also sind sie nach einem Neustart oder Update weg. Du kannst den Modus für jeden Chat ändern.",
+        "forced_notice": "config.json konnte nicht gelesen werden, deshalb starten neue Chats im Modus Temporär, bis die Datei repariert und {{productName}} neu gestartet ist. Temporär-Chats werden nicht gespeichert und sind nach einem Neustart oder Update weg.",
         "label": "Standard-Speichermodus",
-        "persistent": "Dauerhaft"
+        "persistent": "Dauerhaft",
+        "unsaved_notice": "Neue Chats werden nicht gespeichert: Ihr Chatverlauf ist nach einem Neustart oder Update weg."
       },
       "plainDiff": {
         "description": "Diffs als einfachen Unified-Diff-Text ohne Syntaxhervorhebung anzeigen. Benötigt bei großen Diffs weniger Speicher.",

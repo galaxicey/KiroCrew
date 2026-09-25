@@ -153,13 +153,13 @@ describe('WelcomeView', () => {
     const cards = Array.from(popover.querySelectorAll('button')).map(b => b.textContent)
     expect(cards).toHaveLength(2)
     expect(cards[0]).toContain(i18nT('components.welcomeView.incognito'))
-    expect(cards[0]).toContain(
-      'Uses existing memory but learns no lessons. Keeps the transcript for tab recovery.',
-    )
+    // The description says the chat is NOT saved -- the one fact the picker
+    // must carry, since these modes write no transcript.
+    expect(cards[0]).toContain(i18nT('components.welcomeView.incognito_desc'))
+    expect(cards[0]).toMatch(/Not saved: the transcript exists only while .* is running/)
     expect(cards[1]).toContain(i18nT('components.welcomeView.temporary'))
-    expect(cards[1]).toContain(
-      'Uses no memory and learns no lessons. Keeps the transcript for tab recovery.',
-    )
+    expect(cards[1]).toContain(i18nT('components.welcomeView.temporary_desc'))
+    expect(cards[1]).toMatch(/Not saved: the transcript exists only while .* is running/)
   })
 
   it('an outside mousedown closes the popover, one inside keeps it', () => {

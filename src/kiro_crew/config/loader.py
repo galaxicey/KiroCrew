@@ -2346,6 +2346,33 @@ def _default_memory_mode_from(raw: object) -> str:
     return raw if isinstance(raw, str) and raw in _DEFAULT_MEMORY_MODES else "temporary"
 
 
+# Set once the fail-closed Temporary default has been announced in this process.
+# The gateway loads config repeatedly; the forcing is per-install information, so
+# it is said once per boot, like ``_REPORTED_SUPERSEDED_KEYS`` below.
+_REPORTED_FORCED_TEMPORARY_DEFAULT = False
+
+
+def _report_forced_temporary_default() -> None:
+    """Warn once that unreadable config forced new chats to Temporary.
+
+    The forcing itself is silent by construction -- it is a privacy default, not a
+    failure -- but its consequence is not: a Temporary chat's transcript lives only
+    in the running gateway, so every new chat opened until the file is fixed is
+    gone at the next restart. That is a data-loss condition the operator must be
+    told about in the one place they can see without opening the dashboard.
+    """
+    global _REPORTED_FORCED_TEMPORARY_DEFAULT
+    if _REPORTED_FORCED_TEMPORARY_DEFAULT:
+        return
+    _REPORTED_FORCED_TEMPORARY_DEFAULT = True
+    logger.warning(
+        "config.json (or its 'dashboard' section) could not be read, so new "
+        "dashboard chats default to Temporary until the file is fixed and the "
+        "gateway restarts. Temporary chats are not written to disk: their "
+        "transcript is lost when the gateway restarts or upgrades."
+    )
+
+
 # (section, key, min, max) for each bounded field clamped at load time. The
 # mins match the runtime floors: subagent_auto_max has a floor of 3
 # (``subagent._LEGACY_DEFAULT_MAX`` — the auto-size minimum), so a value < 3 is
@@ -4135,6 +4162,18 @@ class KiroCrewConfig:
         """Sections this load discarded (see ``_degraded_sections``)."""
         return self._degraded_sections
 
+    @property
+    def default_memory_mode_forced(self) -> bool:
+        """True when unreadable config forced ``dashboard.default_memory_mode``.
+
+        The same predicate the two forcing sites in :meth:`load` apply, read
+        back off the loaded object so the dashboard can tell a Temporary
+        default the operator chose from one the loader imposed -- the two need
+        different words, and only the second names a file to fix.
+        """
+        degraded = self._degraded_sections
+        return DEGRADED_WHOLE_CONFIG in degraded or "dashboard" in degraded
+
     timezone: str = field(
         default="",
         metadata=_meta(
@@ -4418,6 +4457,7 @@ class KiroCrewConfig:
                     or "dashboard" in _OBSERVED_DEGRADED_SECTIONS
                 ):
                     cfg.dashboard.default_memory_mode = "temporary"
+                    _report_forced_temporary_default()
                 cfg.skills.project_skills_enabled = (
                     data.get("skills", {}).get("project_skills_enabled", True) is True
                 )
@@ -4585,6 +4625,7 @@ class KiroCrewConfig:
             or DEGRADED_WHOLE_CONFIG in _OBSERVED_DEGRADED_SECTIONS
         ):
             dashboard_data["default_memory_mode"] = "temporary"
+            _report_forced_temporary_default()
         stt_data = _coerced_section(data, "stt", _degraded)
         computer_use_data = _coerced_section(data, "computer_use", _degraded)
         instances_data = _coerced_section(data, "instances", _degraded)

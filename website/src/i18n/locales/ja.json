@@ -8282,7 +8282,7 @@
     "welcomeView": {
       "autopilot": "オートパイロット",
       "incognito": "プライベート",
-      "incognito_desc": "既存のメモリを使いますが、新しいレッスンは学習しません。タブを復元できるよう、会話記録は保持します。",
+      "incognito_desc": "既存のメモリを使いますが、新しいレッスンは学習しません。保存されません。会話記録は {{productName}} の実行中にだけ存在し、再起動やアップグレード後には消えます。",
       "refresh_suggestions": "提案を更新",
       "simple_tasks_run_instantly_complex_ones_get_a_pl": "シンプルなタスクは瞬時に実行されます。複雑なものはまず承認するプランを得られます。",
       "suggestion_pipeline_status": "パイプラインステータスを確認",
@@ -8295,7 +8295,7 @@
       "incognito_active_switch_to_persistent": "プライベート — 永続モードに切り替える",
       "temporary": "一時的",
       "temporary_active_switch_to_persistent": "一時的 — 永続モードに切り替える",
-      "temporary_desc": "メモリを使わず、新しいレッスンも学習しません。タブを復元できるよう、会話記録は保持します。",
+      "temporary_desc": "メモリを使わず、新しいレッスンも学習しません。保存されません。会話記録は {{productName}} の実行中にだけ存在し、再起動やアップグレード後には消えます。",
       "try_create_a_plan_to_analyze_kirocrew_code_packa": "試す：「{{productName}} コードパッケージを分析し、主要コンポーネント別のファイル数をレポートするプランを作成してください」",
       "what_can_i_do_for_you": "何かお手伝いできることはありますか？"
     },
@@ -8733,6 +8733,11 @@
       "unexpected_response": "予期しないレスポンス",
       "deploy_failed": "デプロイに失敗",
       "stale_preview_retry": "チェック後にアプリが変更されました — もう一度お試しください。"
+    },
+    "unsavedDefaultNotice": {
+      "config_unreadable_forced_temporary": "config.json を読み取れなかったため、ファイルを修正して {{productName}} を再起動するまで、新しいチャットは既定で一時的モードになります。一時的のチャットの会話記録は {{productName}} の実行中にだけ存在し、再起動やアップグレード後には消えます。",
+      "new_chats_are_not_being_saved": "新しいチャットは保存されていません",
+      "open_chat_settings": "チャット設定を開く"
     }
   },
   "hooks": {
@@ -15996,9 +16001,11 @@
   "settings": {
     "chat": {
       "defaultMemoryMode": {
-        "description": "永続は既知の情報を使い、新しいメモリを保存します。プライベートは既知の情報を使いますが、新しいメモリは保存しません。一時的は空の状態で始まり、何も保存しません。すべてのチャットは履歴に残ります。各チャットのモードは変更できます。",
+        "description": "永続は既知の情報を使い、新しいメモリを保存し、すべてのチャットを履歴に残します。プライベートは既知の情報を使いますが、新しいメモリは保存しません。一時的は空の状態で始まり、何も保存しません。プライベートと一時的のチャットは保存されません。ディスクには何も書き込まれないため、再起動やアップグレード後には消えます。各チャットのモードは変更できます。",
+        "forced_notice": "config.json を読み取れなかったため、ファイルを修正して {{productName}} を再起動するまで、新しいチャットは既定で一時的モードになります。一時的のチャットは保存されず、再起動やアップグレード後には消えます。",
         "label": "デフォルトのメモリモード",
-        "persistent": "永続"
+        "persistent": "永続",
+        "unsaved_notice": "新しいチャットは保存されません。会話記録は再起動やアップグレード後には消えます。"
       },
       "plainDiff": {
         "description": "差分を構文ハイライトなしのプレーンな unified diff テキストとして表示します。大きな差分でのメモリ使用量が減ります。",

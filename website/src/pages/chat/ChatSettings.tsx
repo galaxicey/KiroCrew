@@ -159,6 +159,12 @@ export interface DashboardConfig {
   restore_window_minutes: number
   merge_queued_messages: boolean
   default_memory_mode: MemoryMode
+  /**
+   * Read-only, set by the gateway: true when config.json (or its `dashboard`
+   * section) could not be read and the loader forced `default_memory_mode` to
+   * `temporary`. Optional because a gateway older than the field omits it.
+   */
+  default_memory_mode_forced?: boolean
   widget_density: 'more' | 'less'
   use_builtin_browser: boolean
   verbosity: 'default' | 'concise' | 'ultra' | 'answer_only'

@@ -8282,7 +8282,7 @@
     "welcomeView": {
       "autopilot": "오토파일럿",
       "incognito": "시크릿",
-      "incognito_desc": "기존 메모리를 사용하지만 새로운 학습 내용은 만들지 않습니다. 탭 복구를 위해 대화 기록은 보관합니다.",
+      "incognito_desc": "기존 메모리를 사용하지만 새로운 학습 내용은 만들지 않습니다. 저장되지 않습니다. 대화 기록은 {{productName}}이(가) 실행 중일 때만 존재하며, 다시 시작하거나 업그레이드하면 사라집니다.",
       "refresh_suggestions": "제안 새로 고침",
       "simple_tasks_run_instantly_complex_ones_get_a_pl": "간단한 작업은 즉시 실행됩니다. 복잡한 작업은 먼저 승인할 계획을 제시합니다.",
       "suggestion_pipeline_status": "파이프라인 상태 확인",
@@ -8295,7 +8295,7 @@
       "incognito_active_switch_to_persistent": "시크릿 — 영구 모드로 전환",
       "temporary": "임시",
       "temporary_active_switch_to_persistent": "임시 — 영구 모드로 전환",
-      "temporary_desc": "메모리를 사용하지 않고 새로운 학습 내용도 만들지 않습니다. 탭 복구를 위해 대화 기록은 보관합니다.",
+      "temporary_desc": "메모리를 사용하지 않고 새로운 학습 내용도 만들지 않습니다. 저장되지 않습니다. 대화 기록은 {{productName}}이(가) 실행 중일 때만 존재하며, 다시 시작하거나 업그레이드하면 사라집니다.",
       "try_create_a_plan_to_analyze_kirocrew_code_packa": "예시: ‘{{productName}} 코드 패키지를 분석하고 주요 구성 요소별 파일 수를 보고하는 계획을 만드세요’",
       "what_can_i_do_for_you": "무엇을 도와드릴까요?"
     },
@@ -8733,6 +8733,11 @@
       "unexpected_response": "예기치 않은 응답",
       "deploy_failed": "배포에 실패했습니다",
       "stale_preview_retry": "확인 후 앱이 변경되었습니다 — 다시 시도하세요."
+    },
+    "unsavedDefaultNotice": {
+      "config_unreadable_forced_temporary": "config.json을 읽을 수 없어서 파일을 고치고 {{productName}}을(를) 다시 시작하기 전까지 새 채팅은 기본적으로 임시 모드로 시작합니다. 임시 채팅의 대화 기록은 {{productName}}이(가) 실행 중일 때만 존재하며, 다시 시작하거나 업그레이드하면 사라집니다.",
+      "new_chats_are_not_being_saved": "새 채팅이 저장되지 않고 있습니다",
+      "open_chat_settings": "채팅 설정 열기"
     }
   },
   "hooks": {
@@ -15996,9 +16001,11 @@
   "settings": {
     "chat": {
       "defaultMemoryMode": {
-        "description": "영구 모드는 이미 아는 내용을 사용하고 새 메모리를 저장합니다. 시크릿 모드는 아는 내용을 사용하지만 새 메모리를 저장하지 않습니다. 임시 모드는 빈 상태로 시작하고 아무것도 저장하지 않습니다. 모든 채팅은 기록에 계속 표시됩니다. 각 채팅의 모드를 바꿀 수 있습니다.",
+        "description": "영구 모드는 이미 아는 내용을 사용하고 새 메모리를 저장하며 모든 채팅을 기록에 남깁니다. 시크릿 모드는 아는 내용을 사용하지만 새 메모리를 저장하지 않습니다. 임시 모드는 빈 상태로 시작하고 아무것도 저장하지 않습니다. 시크릿·임시 채팅은 저장되지 않습니다. 디스크에 아무것도 쓰지 않으므로 다시 시작하거나 업그레이드하면 사라집니다. 각 채팅의 모드를 바꿀 수 있습니다.",
+        "forced_notice": "config.json을 읽을 수 없어서 파일을 고치고 {{productName}}을(를) 다시 시작하기 전까지 새 채팅은 기본적으로 임시 모드로 시작합니다. 임시 채팅은 저장되지 않으며, 다시 시작하거나 업그레이드하면 사라집니다.",
         "label": "기본 메모리 모드",
-        "persistent": "영구"
+        "persistent": "영구",
+        "unsaved_notice": "새 채팅은 저장되지 않습니다. 대화 기록은 다시 시작하거나 업그레이드하면 사라집니다."
       },
       "plainDiff": {
         "description": "차이를 구문 강조 없이 일반 unified diff 텍스트로 표시합니다. 큰 diff에서 메모리를 덜 사용합니다.",

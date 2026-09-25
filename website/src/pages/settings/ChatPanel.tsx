@@ -2,7 +2,7 @@ import { useState, useCallback, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { SettingsSection, SettingsCard, SettingsToggle, SettingsSelect, SettingsInput, SettingsButtonGroup, SettingsField, SettingsMultiSelect, SettingsStepper } from '../../components/settings'
 import { Btn, Input } from '../../components/ui'
-import { Plus, Trash2 } from 'lucide-react'
+import { AlertTriangle, Plus, Trash2 } from 'lucide-react'
 import { configPatternRefused, configUrlTemplateOk } from '../../utils/autolinkRules'
 
 /** One `dashboard.link_patterns` rule as it travels the config wire; the
@@ -1407,6 +1407,34 @@ export function ChatPanel() {
             disabled={dashDisabled || defaultModeMut.isPending}
             configKey="dashboard.default_memory_mode"
           />
+          {/* The consequence of a non-persistent default, said where it is
+              chosen. The row's description states it as a fact about the
+              modes; this notice states it about THIS install's default, keyed
+              off the SHOWN value so it lands the moment the pick does and
+              stays as a reminder while the default is in force.
+              `role="status"` so a screen reader hears the consequence right
+              after the pick is announced. The forced variant is a different
+              thing: config.json could not be read and the loader fell back to
+              Temporary, a failure the operator has to fix -- so it renders
+              through ErrorNotice (AUTOSDE errors-use-error-notice), with the
+              agent hand-off on because every control on this card saves on
+              change and there is no draft the hand-off could lose. */}
+          {dashCfg.default_memory_mode_forced ? (
+            <ErrorNotice
+              testId="default-memory-mode-unsaved-notice"
+              message={i18nT('settings.chat.defaultMemoryMode.forced_notice')}
+              askAgent
+            />
+          ) : asMemoryMode(shownDefaultMemoryMode) !== 'persistent' && (
+            <p
+              role="status"
+              data-testid="default-memory-mode-unsaved-notice"
+              className="text-[12px] text-warn m-0 flex items-start gap-1.5"
+            >
+              <AlertTriangle size={13} className="flex-none mt-0.5" />
+              {i18nT('settings.chat.defaultMemoryMode.unsaved_notice')}
+            </p>
+          )}
           <SettingsToggle label={i18nT('pages.settings.chatPanel.tail_only_fork')} description={i18nT('pages.settings.chatPanel.fork_keeps_only_the_messages_after_the_chosen_po')} checked={dashCfg.tail_fork_enabled} onChange={v => setDash({ tail_fork_enabled: v })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.restore_sessions')} description={i18nT('pages.settings.chatPanel.re_open_recently_active_sessions_on_startup')} checked={dashCfg.restore_sessions} onChange={v => setDash({ restore_sessions: v })} disabled={dashDisabled} />
           {dashCfg.restore_sessions && (

@@ -510,6 +510,52 @@ describe('ChatPanel — Sessions', () => {
     )
   })
 
+  // The consequence of a non-persistent default is said where it is chosen:
+  // an Incognito/Temporary chat's transcript is never written to disk, so it
+  // is gone at the next gateway restart. The notice keys off the SHOWN value,
+  // so it lands with the pick rather than after the round-trip.
+  it('shows no unsaved-chats notice while the default is persistent', async () => {
+    wrap()
+    await screen.findByRole('combobox', { name: 'Default Memory Mode' })
+    expect(screen.queryByTestId('default-memory-mode-unsaved-notice')).toBeNull()
+  })
+
+  it('warns the moment the default is switched to a non-persistent mode', async () => {
+    wrap()
+    await pickOption('Default Memory Mode', 2)
+    const notice = await screen.findByTestId('default-memory-mode-unsaved-notice')
+    expect(notice).toHaveTextContent(/New chats will not be saved/)
+    expect(notice).toHaveTextContent(/gone after a restart or upgrade/)
+    expect(notice).toHaveAttribute('role', 'status')
+  })
+
+  it('keeps the notice on a stored non-persistent default', async () => {
+    dashboardConfigMock.mockImplementation(
+      () => Promise.resolve({ ...BASE_DASH, default_memory_mode: 'incognito' }) as never,
+    )
+    wrap()
+    expect(await screen.findByTestId('default-memory-mode-unsaved-notice'))
+      .toHaveTextContent(/New chats will not be saved/)
+  })
+
+  it('names config.json when the loader forced the Temporary default', async () => {
+    dashboardConfigMock.mockImplementation(
+      () => Promise.resolve({
+        ...BASE_DASH,
+        default_memory_mode: 'temporary',
+        default_memory_mode_forced: true,
+      }) as never,
+    )
+    wrap()
+    const notice = await screen.findByTestId('default-memory-mode-unsaved-notice')
+    expect(notice).toHaveTextContent(/config\.json could not be read/)
+    expect(notice).not.toHaveTextContent(/New chats will not be saved/)
+    // A config-read failure renders through ErrorNotice (role=alert, agent
+    // hand-off on), unlike the warning for a chosen non-persistent default.
+    expect(notice).toHaveAttribute('role', 'alert')
+    expect(screen.getByRole('button', { name: /ask the agent/i })).toBeInTheDocument()
+  })
+
   it.each([
     ['Split View (Session Grid)', 'session_grid', true],
     ['Tail-only Fork', 'tail_fork_enabled', true],

@@ -3001,10 +3001,12 @@ def _session_has_persisted_history(slot_name: str) -> bool:
 
     A positive signal that the session was previously **established** — i.e.
     that the key belongs to a real session rather than being forged or stale.
-    It says nothing about the session's ``memory_mode``: every mode writes its
-    transcript to disk (``_save_slot_to_history`` has no ``memory_mode`` gate,
-    by design, so incognito/temporary tabs still survive a reload). Callers
-    gating *memory writes* must therefore consult
+    It says nothing about the session's ``memory_mode``: a file written while
+    the session was persistent, or before incognito/temporary stopped writing
+    transcripts, survives the mode it later carries (``_save_slot_to_history``
+    returns early for a restricted slot, so a restricted slot born today has
+    no file at all and lives only in the running gateway). Callers gating
+    *memory writes* must therefore consult
     :func:`_persisted_session_memory_mode` as well — file existence alone is
     not evidence that writes are permitted.
 

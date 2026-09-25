@@ -227,6 +227,138 @@ class TestHistoryPersistence:
         assert state.conversation_log.list_sessions() == []
 
 
+class TestRestrictedTitlePersist:
+    """``_persist_title`` must not mint a metadata-only record for a restricted slot.
+
+    ``_save_slot_to_history`` writes nothing for incognito/temporary, so the title
+    writer was the last path able to CREATE the session file. It did, via
+    ``update_metadata``'s upsert, and the line it wrote carried no ``memory_mode``
+    -- so after a gateway restart the ghost was listed in History and restored as
+    an empty *persistent* session. These tests pin the three sides of the fix: no
+    record for a restricted slot, the persistent path byte-for-byte as before, and
+    an already-existing restricted record (a transcript written before the mode
+    stopped persisting) still taking the title.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["incognito", "temporary"])
+    async def test_restricted_title_persist_creates_no_record(self, tmp_path, monkeypatch, mode):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard.chat import _save_slot_to_history, restore_recent_sessions
+        from kiro_crew.dashboard.chat_title import _persist_title
+
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("ghost", memory_mode=mode)
+        slot.append("user", "my private question")
+        slot.append("assistant", "the answer")
+        _save_slot_to_history(state, slot)
+        slot.title = "Private topic"
+        slot._titled = True
+
+        assert await _persist_title(state, slot) is True
+
+        assert slot.title == "Private topic"
+        assert not state.conversation_log._path("dashboard:ghost").exists()
+        assert state.conversation_log.list_sessions() == []
+
+        # A gateway restart within the restore window finds nothing to bring back:
+        # neither an open tab nor a History row.
+        state2 = _make_state(tmp_path)
+        assert restore_recent_sessions(state2, window_minutes=0) == 0
+        assert "ghost" not in state2._slots
+        assert state2.conversation_log.list_sessions() == []
+
+    @pytest.mark.asyncio
+    async def test_persistent_title_persist_unchanged(self, tmp_path, monkeypatch):
+        """Persistent slots keep writing the title header exactly as before."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard.chat import _save_slot_to_history, restore_recent_sessions
+        from kiro_crew.dashboard.chat_title import _persist_title
+
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("kept")
+        slot.append("user", "hello")
+        slot.append("assistant", "hi")
+        _save_slot_to_history(state, slot)
+        slot.title = "Kept topic"
+        slot._titled = True
+
+        assert await _persist_title(state, slot) is True
+
+        meta = state.conversation_log.get_metadata("dashboard:kept")
+        assert meta["title"] == "Kept topic"
+        assert meta["memory_mode"] == "persistent"
+        rows = state.conversation_log.list_sessions()
+        assert [(r["title"], r["memory_mode"]) for r in rows] == [("Kept topic", "persistent")]
+
+        state2 = _make_state(tmp_path)
+        assert restore_recent_sessions(state2, window_minutes=0) == 1
+        assert state2._slots["kept"].title == "Kept topic"
+        assert len(state2._slots["kept"].messages) == 2
+
+    @pytest.mark.asyncio
+    async def test_persistent_title_before_first_flush_still_creates_record(
+        self, tmp_path, monkeypatch
+    ):
+        """A persistent slot titled before any flush still gets its header (upsert)."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard.chat_title import _persist_title
+
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("early")
+        slot.title = "Named first"
+        slot._titled = True
+
+        assert await _persist_title(state, slot) is True
+
+        assert state.conversation_log.get_metadata("dashboard:early")["title"] == "Named first"
+
+    @pytest.mark.asyncio
+    async def test_restricted_title_updates_existing_record(self, tmp_path, monkeypatch):
+        """A restricted slot resumed from an existing record still persists renames."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard.chat_title import _persist_title
+
+        state = _make_state(tmp_path)
+        _write_session(
+            state.conversation_log, "dashboard:legacy", [("user", "hi")], memory_mode="incognito"
+        )
+        slot = state.get_or_create_slot("legacy", memory_mode="incognito")
+        slot.title = "Renamed"
+        slot._titled = True
+
+        assert await _persist_title(state, slot) is True
+
+        meta = state.conversation_log.get_metadata("dashboard:legacy")
+        assert meta["title"] == "Renamed"
+        assert meta["memory_mode"] == "incognito"
+        assert state.conversation_log.read_messages("dashboard:legacy") == [
+            {"role": "user", "content": "hi", "ts": "2026-01-01T00:00:01"}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_restricted_title_on_unreadable_record_is_not_durable(
+        self, tmp_path, monkeypatch
+    ):
+        """An existing record whose metadata line cannot be read is a refused write,
+        not the absent-record no-op: the caller must hear ``False``."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard.chat_title import _persist_title
+
+        state = _make_state(tmp_path)
+        path = state.conversation_log._path("dashboard:broken")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json\n", encoding="utf-8")
+        slot = state.get_or_create_slot("broken", memory_mode="incognito")
+        slot.title = "Renamed"
+        slot._titled = True
+
+        assert await _persist_title(state, slot) is False
+
+        assert path.read_text(encoding="utf-8") == "{not json\n"
+        assert slot.title == "Renamed"
+
+
 # ── Restore on gateway restart ──
 
 

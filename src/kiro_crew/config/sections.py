@@ -3302,8 +3302,11 @@ class DashboardConfig:
         metadata=_meta(
             "Default Memory Mode",
             "Memory mode for new dashboard chat sessions. 'persistent' reads "
-            "and writes memory; 'incognito' reads but does not write; "
-            "'temporary' neither reads nor writes. Explicit per-session choices "
+            "and writes memory and keeps the chat's transcript on disk; "
+            "'incognito' reads but does not write; 'temporary' neither reads "
+            "nor writes. An incognito or temporary chat's transcript lives only "
+            "in the running gateway: nothing is written to disk, so it is gone "
+            "after a gateway restart or upgrade. Explicit per-session choices "
             "still win.",
             enum=["persistent", "incognito", "temporary"],
         ),

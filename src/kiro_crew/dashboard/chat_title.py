@@ -1068,6 +1068,21 @@ async def _persist_title(state: DashboardState, slot: _ChatSlot) -> bool:
     that must not proceed on a non-durable mark (the refresh's token budget)
     check the result; best-effort callers ignore it.
 
+    RESTRICTED SLOTS NEVER MINT A RECORD. ``_save_slot_to_history`` writes no
+    transcript for an incognito/temporary slot, so this was the only writer
+    left that could create the session file — and ``update_metadata`` is an
+    upsert, so it did: a metadata-only line carrying the title and no
+    ``memory_mode`` (the mode is published by ``bind_session_execution``,
+    which likewise refuses to create a restricted record). After a restart
+    that ghost was listed in History and restored as an EMPTY persistent
+    session, the one shape a privacy mode must not leave behind. So for a
+    restricted slot the write is ``update_metadata_if(require_existing=True)``:
+    a record that already exists (a transcript written before the mode stopped
+    persisting, or one the slot was resumed from) still takes the title, and
+    an absent one is left absent. The skip returns ``True`` — nothing on disk
+    means nothing a restart could reload, the same reasoning as the
+    no-conversation-log case above.
+
     WRITE-ORDER GUARD: two concurrent persists (a background titler's and a
     manual rename's) race on worker threads, and flock acquisition order is
     unspecified — the stale background write could land LAST on disk, so a
@@ -1095,7 +1110,44 @@ async def _persist_title(state: DashboardState, slot: _ChatSlot) -> bool:
         # True on disk would re-arm the early milestone on every restart.
         fields["title_low_signal"] = slot._title_low_signal
         try:
-            await asyncio.to_thread(state.conversation_log.update_metadata, history_key, fields)
+            if slot.is_restricted:
+                written = await asyncio.to_thread(
+                    state.conversation_log.update_metadata_if,
+                    history_key,
+                    fields,
+                    lambda _meta: True,
+                    require_existing=True,
+                )
+                if not written:
+                    # ``update_metadata_if`` answers False for two different
+                    # things: no record to write into (the intended no-op --
+                    # nothing on disk means nothing a restart could reload,
+                    # so the title IS as durable as it gets), and an existing
+                    # record whose metadata line could not be read (the write
+                    # was refused; the title is NOT on disk). Read the record
+                    # back to tell them apart: only a readable absence is
+                    # ``True``. A record that is unreadable, or that appeared
+                    # between the refused write and this read, is reported as
+                    # not durable so the caller does not spend a budget on it.
+                    meta, readable = await asyncio.to_thread(
+                        state.conversation_log.get_metadata_status, history_key
+                    )
+                    if readable and not meta:
+                        logger.debug(
+                            "Title for restricted slot %s kept in memory only (no record on disk)",
+                            slot.key,
+                        )
+                        return True
+                    logger.debug(
+                        "Title for restricted slot %s not persisted: existing record %s",
+                        slot.key,
+                        "unreadable" if not readable else "changed during the write",
+                    )
+                    return False
+            else:
+                await asyncio.to_thread(
+                    state.conversation_log.update_metadata, history_key, fields
+                )
             logger.debug("Persisted title %r for slot %s", slot.title, slot.key)
         except Exception:
             logger.debug("Failed to persist title for slot %s", slot.key)
@@ -1186,10 +1238,10 @@ async def _maybe_auto_title(state: DashboardState, slot: _ChatSlot) -> None:
     Runs for EVERY ``memory_mode``, temporary included. Titling reads only the
     slot's own messages and prompts the shared ``_bg`` session, so it neither
     reads stored memory nor writes any — the two things a temporary session
-    actually forbids. The title is
-    persisted the same way for every mode because ``_save_slot_to_history``
-    already writes ``meta_line["title"]`` for temporary slots regardless of
-    this path — those sessions keep a transcript on disk for tab recovery.
+    actually forbids. The title lives on the slot for the life of the gateway
+    in every mode; whether it also reaches disk is ``_persist_title``'s call —
+    a restricted slot has no transcript on disk (``_save_slot_to_history``
+    writes none for it) and gets no metadata-only record either.
     """
     if slot._titled:
         return

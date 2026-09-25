@@ -3336,6 +3336,39 @@ class TestDefaultMemoryModeRoundTrip:
         cfg = _load_from_dict("not valid json {{{")
         assert cfg.dashboard.default_memory_mode == "temporary"
 
+    def test_forced_flag_names_only_the_loader_imposed_default(self) -> None:
+        """``default_memory_mode_forced`` tells a chosen Temporary from an imposed one."""
+        assert _load_from_dict({}).default_memory_mode_forced is False
+        chosen = _load_from_dict({"dashboard": {"default_memory_mode": "temporary"}})
+        assert chosen.dashboard.default_memory_mode == "temporary"
+        assert chosen.default_memory_mode_forced is False
+        assert _load_from_dict({"dashboard": "not-an-object"}).default_memory_mode_forced is True
+        assert _load_from_dict("not valid json {{{").default_memory_mode_forced is True
+
+    def test_forced_temporary_is_warned_once_per_process(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The forcing is silent by design; its data-loss consequence is not."""
+        from kiro_crew.config import loader
+
+        with unittest.mock.patch.object(loader, "_REPORTED_FORCED_TEMPORARY_DEFAULT", False):
+            with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
+                _load_from_dict("not valid json {{{")
+                _load_from_dict({"dashboard": "not-an-object"})
+        forced = [r for r in caplog.records if "default to Temporary" in r.getMessage()]
+        assert len(forced) == 1
+        assert "not written to disk" in forced[0].getMessage()
+
+    def test_chosen_temporary_default_is_not_warned_by_the_loader(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from kiro_crew.config import loader
+
+        with unittest.mock.patch.object(loader, "_REPORTED_FORCED_TEMPORARY_DEFAULT", False):
+            with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
+                _load_from_dict({"dashboard": {"default_memory_mode": "temporary"}})
+        assert not [r for r in caplog.records if "default to Temporary" in r.getMessage()]
+
     def test_invalid_value_fails_closed_before_schema_validation(self) -> None:
         """Schema cleanup must not erase corruption into the Persistent default."""
 

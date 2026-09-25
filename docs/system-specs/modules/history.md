@@ -768,31 +768,43 @@ and a caller deleting "the session" removes one half and leaves the other behind
 
 - `set_title(key, title)` — persists a title into the session's metadata line (first line of JSONL)
 
-### Session titling is independent of `memory_mode`
+### Session titling runs for every `memory_mode`; only its persistence differs
 
 Auto-titling (`dashboard/chat_title.py:_maybe_auto_title`) runs for **every**
-`memory_mode` — `persistent`, `incognito`, and `temporary` alike — and the
-resulting title is persisted for all three. This is deliberate, not an
-oversight:
+`memory_mode` — `persistent`, `incognito`, and `temporary` alike. This is
+deliberate, not an oversight: titling reads only the slot's **own** messages and
+prompts the shared `_bg` session. It neither reads stored memory nor writes any,
+so neither of the two guarantees a non-persistent mode actually makes
+(`is_restricted` → no consolidation/lessons; `blocks_reads` → no memory-context
+injection) is engaged by it. Gating titling on `blocks_reads` (as an earlier
+revision did) bought no privacy while leaving temporary tabs permanently labelled
+"New Session…", and the manual `POST /api/chat/slots/{slot}/generate-title`
+endpoint never had such a gate.
 
-- Titling reads only the slot's **own** messages and prompts the shared `_bg`
-  session. It neither reads stored memory nor writes any, so neither of the two
-  guarantees a non-persistent mode actually makes (`is_restricted` → no
-  consolidation/lessons; `blocks_reads` → no memory-context injection) is
-  engaged by it.
-- Persisting the title discloses nothing new. `_save_slot_to_history` has no
-  `memory_mode` gate, so an incognito/temporary slot already writes its **full
-  transcript** to its session JSONL for tab recovery and gateway-restart
-  restore. The title is a summary of content that is already on disk in the same
-  file, and `restore_recent_sessions` skips only on `closed`, never on
-  `memory_mode`.
+What differs by mode is whether the title reaches **disk**, and that follows the
+transcript:
 
-Gating titling on `blocks_reads` (as an earlier revision did) therefore bought
-no privacy while leaving temporary tabs permanently labelled "New Session…".
-The manual `POST /api/chat/slots/{slot}/generate-title` endpoint never had such
-a gate, so a temporary session could already be titled and persisted on demand.
-Do not reintroduce a `memory_mode` condition here without first changing what
-`_save_slot_to_history` writes.
+- A `persistent` slot's title is written into its session metadata line by
+  `_persist_title` (`update_metadata`, an upsert — the line is created if the
+  first flush has not happened yet) and re-asserted by every full save.
+- An `incognito`/`temporary` slot has **no transcript on disk**:
+  `_save_slot_to_history` returns early for a restricted slot, and
+  `bind_session_execution` publishes a restricted mode only into a record that
+  already exists. `_persist_title` therefore writes with
+  `update_metadata_if(require_existing=True)`: a record that already exists (a
+  transcript written before restricted modes stopped persisting, or one the slot
+  was resumed from) takes the title; an absent record stays absent. Before this
+  gate the upsert minted a **metadata-only line with no `memory_mode`**, which
+  `list_sessions()` reported as `persistent` and `restore_recent_sessions` (which
+  skips only on `closed`, never on `memory_mode`) brought back after a restart as
+  an empty persistent session — the one trace a privacy mode must not leave.
+  Pinned by `test_ephemeral_sessions.py::TestRestrictedTitlePersist`.
+
+The consequence for the user is documented rather than hidden: the transcript of
+an incognito/temporary chat lives only in the running gateway and is gone after a
+gateway restart or upgrade. The Settings and Welcome-view copy says so, and
+Settings shows a notice while the default is non-persistent (or forced to
+`temporary` by an unreadable `config.json`).
 
 ## HistoryConsolidator (`history_consolidation.py`, re-exported by `history.py`)
 
