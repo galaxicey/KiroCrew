@@ -5771,13 +5771,31 @@ function ChatSidebar({
   // Flat-view slot list: filteredSlots minus sessions in hidden folders —
   // EXCEPT while searching, where every match must stay reachable so a hidden
   // folder never becomes a search dead-end.
-  const flatSlots = useMemo(() => {
-    if (!folderFilterActive) return filteredSlots
-    return filteredSlots.filter(s => {
-      const fid = localSlotFolder(s, slotFolders)
-      return !(fid && filterHiddenSubtree.has(fid))
-    })
-  }, [filteredSlots, folderFilterActive, filterHiddenSubtree, slotFolders])
+  /** Does the folder filter conceal this row?
+   *
+   *  ONE definition because every lane that renders sessions has to ask it, and each
+   *  asks it where it builds its row POPULATION rather than at its render site: the
+   *  tree lane drops an unchecked folder's whole block, the flat lane strips the rows,
+   *  and the conductor lane keeps them out of its lineage. Asked at a render site
+   *  instead, a lane would have to remember to ask again for every set it derives --
+   *  its matches, its context anchors, its collapsed aggregates -- and the one it
+   *  forgot would put a row on screen the person asked not to see.
+   *
+   *  Distinct from `isFolderHidden`, which is the folder's OWN hide-when-empty
+   *  attribute. This one is the person's choice in the filter menu, and
+   *  `folderFilterActive` turns it off entirely while the search box has text, so a
+   *  hidden folder never becomes a search dead-end. */
+  const isRowFolderHidden = useCallback((s: Slot): boolean => {
+    if (!folderFilterActive) return false
+    const fid = localSlotFolder(s, slotFolders)
+    return !!fid && filterHiddenSubtree.has(fid)
+  }, [folderFilterActive, filterHiddenSubtree, slotFolders])
+
+  /** Flat-view slot list: `filteredSlots` minus every row the folder filter conceals. */
+  const flatSlots = useMemo(
+    () => (folderFilterActive ? filteredSlots.filter(s => !isRowFolderHidden(s)) : filteredSlots),
+    [filteredSlots, folderFilterActive, isRowFolderHidden],
+  )
 
   // ── conductor lane ───────────────────────────────────────────────────────
   //
@@ -5797,11 +5815,21 @@ function ChatSidebar({
    *
    * Order is `laneOrder`, the comparator `filteredSlots` itself sorts by, so root and
    * sibling order still match the flat lane.
+   *
+   * The VIEW filters are what that whole population spans: status, tag and search decide
+   * what the lane is ABOUT, so a row they exclude still belongs in the tree and renders
+   * as a dimmed context anchor. The FOLDER filter is a stronger statement -- the person
+   * asked not to see that folder -- so `isRowFolderHidden` applies HERE, to the
+   * population itself. A concealed row is then absent from the tree, from `byKey` and
+   * from every set derived downstream, so no render site has to ask a second time; its
+   * children resolve no parent and fall back to the orphan-root treatment this lane
+   * already gives a child whose parent it cannot show. The reveal row at the bottom of
+   * the lane stays the way to look inside a hide.
    */
   const conductorRows = useMemo(() => {
     if (!conductorLaneActive) return []
-    return [...allRows].sort(laneOrder)
-  }, [conductorLaneActive, allRows, laneOrder])
+    return [...allRows].filter(s => !isRowFolderHidden(s)).sort(laneOrder)
+  }, [conductorLaneActive, allRows, laneOrder, isRowFolderHidden])
 
   /**
    * Row identities the active filter ADMITS, as the flat lane computed them.
