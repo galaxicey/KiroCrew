@@ -369,8 +369,10 @@ _GLOBAL_EVENT_DECLARATIONS: dict[str, str] = {
     # A bare {"ts": ...} refresh signal -- no slot, no session key, no counts.
     # It says the session-health verdict moved and nothing about what it says, so
     # it rides the declaration that already governs the session domain rather
-    # than inventing a scope: a holder of `sessions` could already read
-    # `GET /api/sessions/health`, and a holder of nothing still gets neither.
+    # than inventing a scope. `events` and `api` are independent manifest fields,
+    # so a holder of `sessions` is NOT thereby a reader of
+    # `GET /api/sessions/health`; the frame discloses nothing that endpoint
+    # would, and a holder of nothing still gets neither.
     "session_health_changed": "sessions",
     "yolo_expired": "yolo",
     # Artifact metadata only ({slug, version, deleted}) -- no content, no slot.

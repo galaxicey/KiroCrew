@@ -914,23 +914,75 @@ def health_verdict_fingerprint(health: Mapping[str, Any] | None) -> str:
 
     Deliberately excludes every age, timestamp and monotonic reading. Those move
     on every sample, so folding them in would make each computation look like a
-    change and turn a periodic refresh into a periodic broadcast. What is left is
-    the closed-set verdict: the per-classification counts, the degrade reason,
-    and WHICH slots are stalled.
+    change and turn a periodic refresh into a periodic broadcast. Everything else
+    the payload says is folded in BY IDENTITY, never only by count: which
+    classification each slot holds, which slots are stalled, which slot and task
+    rows are waiting or recovering and in which state, the queue's per-state
+    tallies, the effective caps per lane, and the degrade reason. A count alone
+    is not enough -- one row leaving a state as another enters it keeps every
+    count still while the rows a subscriber holds are wrong.
 
     The digest is process-internal. Only the bare signal is broadcast, so the slot
-    keys hashed here are compared and never published.
+    keys and task ids hashed here are compared and never published.
     """
     src = health if isinstance(health, Mapping) else {}
     counts = src.get("counts")
     counts_part = (
-        ";".join(f"{k}={counts[k]}" for k in sorted(counts)) if isinstance(counts, Mapping) else ""
+        ";".join(f"{k}={counts[k]}" for k in sorted(counts, key=str))
+        if isinstance(counts, Mapping)
+        else ""
+    )
+    slots = src.get("slots")
+    slots_part = (
+        ",".join(
+            f"{k}={slots[k].get('classification')}"
+            for k in sorted(slots, key=str)
+            if isinstance(slots[k], Mapping)
+        )
+        if isinstance(slots, Mapping)
+        else ""
     )
     stalled = src.get("stalled")
     stalled_part = ",".join(sorted(str(k) for k in stalled)) if isinstance(stalled, Mapping) else ""
+
+    def _rows_part(rows: Any) -> str:
+        # Slot rows carry key+reason, task rows id+state: the identity and the
+        # state of each row, never its age.
+        if not isinstance(rows, list):
+            return ""
+        idents = sorted(
+            f"{r.get('kind')}:{r.get('key', r.get('id'))}={r.get('reason', r.get('state'))}"
+            for r in rows
+            if isinstance(r, Mapping)
+        )
+        return ",".join(idents)
+
+    waiting_part = _rows_part(src.get("waiting"))
+    recovering_part = _rows_part(src.get("recovering"))
+    queued = src.get("queued")
+    by_state = queued.get("by_state") if isinstance(queued, Mapping) else None
+    queued_part = (
+        ";".join(f"{k}={by_state[k]}" for k in sorted(by_state, key=str))
+        if isinstance(by_state, Mapping)
+        else ""
+    )
+    caps = src.get("effective_caps")
+    caps_part = (
+        ";".join(
+            f"{lane}:" + ",".join(f"{k}={caps[lane][k]}" for k in sorted(caps[lane], key=str))
+            for lane in sorted(caps, key=str)
+            if isinstance(caps[lane], Mapping)
+        )
+        if isinstance(caps, Mapping)
+        else ""
+    )
     degrade = src.get("degrade_reason")
     degrade_part = "" if degrade is None else str(degrade)
-    canonical = f"counts[{counts_part}]|stalled[{stalled_part}]|degrade[{degrade_part}]"
+    canonical = (
+        f"counts[{counts_part}]|slots[{slots_part}]|stalled[{stalled_part}]"
+        f"|waiting[{waiting_part}]|recovering[{recovering_part}]|queued[{queued_part}]"
+        f"|caps[{caps_part}]|degrade[{degrade_part}]"
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -946,8 +998,10 @@ def publish_health_change(
     The frame carries ``{"ts": <wall clock>}`` and nothing else: no slot, no
     session key, no counts. Delivery to an app token is still decided by the
     normal WS scope gate (``ws_event_scope``), which requires the pre-existing
-    ``sessions`` declaration for this event, so nothing here widens a permission
-    or hands an app a session it could not already read.
+    ``sessions`` declaration for this event. That declaration does not imply
+    ``api`` access to ``GET /api/sessions/health`` -- the two manifest fields are
+    independent -- which is exactly why the frame must stay data-free: it hands a
+    holder nothing that endpoint would, and widens no permission.
     """
     mon = monitor or _default_monitor
     digest = health_verdict_fingerprint(health)

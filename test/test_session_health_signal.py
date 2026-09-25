@@ -57,10 +57,20 @@ def _reset_cache():
     sessions._health_cache = {}
     sessions._health_cache_ts = 0.0
     sessions._health_lock = sessions.LoopBoundLock()
+    # The seam under test (refresh_session_health) publishes through the
+    # process-global monitor, and any earlier health test on the same xdist
+    # worker may already have seeded its baseline. Start every test from
+    # "nothing published yet" and hand the prior baseline back afterwards.
+    mon = session_health.default_monitor()
+    with mon._lock:
+        prior = mon._published_verdict
+        mon._published_verdict = None
     yield
     sessions._health_cache = {}
     sessions._health_cache_ts = 0.0
     sessions._health_lock = sessions.LoopBoundLock()
+    with mon._lock:
+        mon._published_verdict = prior
 
 
 class _RecordingState:
@@ -111,6 +121,95 @@ class TestVerdictFingerprint:
         one = session_health.health_verdict_fingerprint(_health(stalled=("sess-a",)))
         other = session_health.health_verdict_fingerprint(_health(stalled=("sess-b",)))
         assert one != other
+
+    def test_a_slot_changing_classification_moves_the_digest_at_an_equal_count(self):
+        """``counts`` folds every waiting kind into one number, so a slot going
+        from waiting_input to waiting_permission -- or two slots swapping
+        states -- leaves the counts identical. The per-slot classification is
+        what makes that a change."""
+        base = _health(running=1)
+        base["slots"]["sess-2"] = {"classification": "waiting_input", "age_secs": 3.0}
+        moved = _health(running=1)
+        moved["slots"]["sess-2"] = {"classification": "waiting_permission", "age_secs": 3.0}
+        assert session_health.health_verdict_fingerprint(
+            base
+        ) != session_health.health_verdict_fingerprint(moved)
+        swapped = _health(running=1)
+        swapped["slots"] = {
+            "sess-1": {"classification": "waiting_input", "age_secs": 3.0},
+            "sess-2": {"classification": "running", "age_secs": 12.5},
+        }
+        assert session_health.health_verdict_fingerprint(
+            base
+        ) != session_health.health_verdict_fingerprint(swapped)
+
+    def test_an_effective_cap_change_moves_the_digest(self):
+        base = _health(running=1)
+        base["effective_caps"] = {"subagents": {"adaptive": 4, "ceiling": 8, "paused": False}}
+        same = _health(running=1)
+        same["effective_caps"] = {"subagents": {"paused": False, "ceiling": 8, "adaptive": 4}}
+        lowered = _health(running=1)
+        lowered["effective_caps"] = {"subagents": {"adaptive": 2, "ceiling": 8, "paused": False}}
+        fp = session_health.health_verdict_fingerprint
+        assert fp(base) == fp(same)  # key order is not a change
+        assert fp(base) != fp(lowered)
+
+    def test_a_balanced_task_row_swap_moves_the_digest(self):
+        """Task rows reach ``counts`` only as ``len(waiting)``: task A leaving a
+        wait state as task B enters one keeps every count still, yet the rows a
+        subscriber holds are wrong. Row identity and state are what catch it;
+        the row's age is still ignored."""
+        fp = session_health.health_verdict_fingerprint
+
+        def row(task_id: str, state: str, age: float) -> dict:
+            return {"kind": "task", "id": task_id, "state": state, "reason": state, "age_secs": age}
+
+        a = _health(running=1)
+        a["waiting"] = [row("t-a", "waiting_dependency", 3.0)]
+        a["recovering"] = [row("t-c", "retry_scheduled", 1.0)]
+        same_older = _health(running=1)
+        same_older["waiting"] = [row("t-a", "waiting_dependency", 99.0)]
+        same_older["recovering"] = [row("t-c", "retry_scheduled", 50.0)]
+        assert fp(a) == fp(same_older)
+        swapped = _health(running=1)
+        swapped["waiting"] = [row("t-b", "waiting_dependency", 3.0)]
+        swapped["recovering"] = [row("t-c", "retry_scheduled", 1.0)]
+        assert fp(a) != fp(swapped)
+        restated = _health(running=1)
+        restated["waiting"] = [row("t-a", "waiting_input", 3.0)]
+        restated["recovering"] = [row("t-c", "retry_scheduled", 1.0)]
+        assert fp(a) != fp(restated)
+        # A recovering row moving between task ids at an equal count, too.
+        other_recovering = _health(running=1)
+        other_recovering["waiting"] = [row("t-a", "waiting_dependency", 3.0)]
+        other_recovering["recovering"] = [row("t-d", "retry_scheduled", 1.0)]
+        assert fp(a) != fp(other_recovering)
+
+    def test_the_queue_by_state_tally_moves_the_digest_but_its_oldest_wait_does_not(self):
+        fp = session_health.health_verdict_fingerprint
+        a = _health(running=1)
+        a["queued"] = {
+            "available": True,
+            "count": 2,
+            "oldest_wait_secs": 4.0,
+            "by_state": {"queued": 2},
+        }
+        aged = _health(running=1)
+        aged["queued"] = {
+            "available": True,
+            "count": 2,
+            "oldest_wait_secs": 40.0,
+            "by_state": {"queued": 2},
+        }
+        moved = _health(running=1)
+        moved["queued"] = {
+            "available": True,
+            "count": 2,
+            "oldest_wait_secs": 4.0,
+            "by_state": {"queued": 1, "waiting_dependency": 1},
+        }
+        assert fp(a) == fp(aged)
+        assert fp(a) != fp(moved)
 
     def test_survives_a_missing_or_malformed_health_dict(self):
         for bad in (None, {}, {"counts": None, "stalled": 7, "degrade_reason": None}):
@@ -394,7 +493,9 @@ class TestDriverGateIsFunctional:
 
         return FakeWebSocket()
 
-    def _drive_connect(self, monkeypatch, *, declared: list[str]) -> list[object]:
+    def _drive_connect(
+        self, monkeypatch, *, declared: list[str], interval: float = 0.01
+    ) -> list[object]:
         """Connect an app token declaring *declared*; return the refresh calls."""
         from kiro_crew.dashboard import ws as dashboard_ws
         from kiro_crew.dashboard.handlers import source_providers
@@ -412,7 +513,7 @@ class TestDriverGateIsFunctional:
         # ws.py imports both of these INSIDE the loop body, so patching the
         # module attributes here is what the driver will pick up when it runs.
         monkeypatch.setattr(sessions, "refresh_session_health", _recording_refresh)
-        monkeypatch.setattr(sessions, "_HEALTH_REFRESH_SECS", 0.01)
+        monkeypatch.setattr(sessions, "_HEALTH_REFRESH_SECS", interval)
 
         state = MagicMock()
         state.owner_id = "U_OWNER"
@@ -448,3 +549,13 @@ class TestDriverGateIsFunctional:
             "a socket that declared `sessions` must still drive the refresh, "
             "or the gate has turned the mechanism off entirely"
         )
+
+    def test_the_first_tick_is_at_connect_not_after_an_interval(self, monkeypatch):
+        """The first computation in a process is the silent baseline. A driver
+        that slept before its first tick would let a verdict that moved during
+        that sleep BECOME the baseline and never signal it -- so the baseline is
+        pinned at connect time, before any interval has elapsed."""
+        # An interval far longer than the fake socket stays open: a driver that
+        # sleeps first never reaches refresh; one that refreshes first does.
+        calls = self._drive_connect(monkeypatch, declared=["sessions"], interval=60.0)
+        assert len(calls) == 1

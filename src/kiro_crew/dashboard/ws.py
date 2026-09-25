@@ -828,13 +828,22 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
             # Guard the BODY, not the loop: one transient failure must log and
             # keep the driver alive rather than silently reverting to the
             # signal-only-on-poll behaviour this loop exists to fix.
+            #
+            # Refresh FIRST, then sleep. The first computation in a process is
+            # the silent baseline, so a driver that slept before its first tick
+            # would let a verdict that moved during that sleep BECOME the
+            # baseline and never signal it; computing at connect time pins the
+            # baseline to what the subscriber sees when it connects. TTL-gated,
+            # so a burst of connects still costs one computation. The sleep sits
+            # OUTSIDE the guard so a refresh that keeps failing waits out the
+            # interval like a successful one instead of spinning.
             try:
-                await asyncio.sleep(_HEALTH_REFRESH_SECS)
                 await refresh_session_health(state)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.warning("session health refresh tick failed; continuing", exc_info=True)
+            await asyncio.sleep(_HEALTH_REFRESH_SECS)
 
     # Function-local import for the same boot-path reason the loop above imports
     # its handler seam locally: `session_health` is not otherwise on ws.py's
