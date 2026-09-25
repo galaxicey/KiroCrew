@@ -587,6 +587,20 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
         )
         return split_markdown_safe(f"{speaker}: {text}", max_chars, redactor=redact_via_context)
 
+    def _compose_units() -> tuple[list[list[str]], list[str]]:
+        """Every selected row's units, composed off the loop thread.
+
+        Offloaded for the same reason the selection above is, and it matters more
+        here: splitting redacts and re-scans each candidate boundary, an imported
+        history row carries no size cap, and on the loop thread one large row
+        holds the loop long enough for the liveness watchdog to exit the process.
+        The Slack twin offloads its own split for this reason.
+        """
+        return (
+            [[unit for row in turn for unit in _units_for(row)] for turn in selection.recent],
+            [unit for row in selection.first_turn for unit in _units_for(row)],
+        )
+
     # Bound the INLINE delivery. Unlike the Slack drain this cannot be
     # backgrounded -- the per-unit governance re-check below has to be able to
     # fail the request closed with 403 -- so an unbounded loop would reintroduce
@@ -599,12 +613,7 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
     # cannot afford is folded into the gap marker's count. Trimming composed
     # units instead would cut a reply mid-sentence and could drop the marker
     # itself -- the one line telling the reader history is missing.
-    recent_turn_units = [
-        [unit for row in turn for unit in _units_for(row)] for turn in selection.recent
-    ]
-    head_units: list[str] = []
-    for row in selection.first_turn:
-        head_units.extend(_units_for(row))
+    recent_turn_units, head_units = await asyncio.to_thread(_compose_units)
 
     total_turns = len(recent_turn_units)
 
