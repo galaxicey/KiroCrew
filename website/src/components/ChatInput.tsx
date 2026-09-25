@@ -801,6 +801,15 @@ const NO_VOICE: Partial<ComposerVoiceInputProps> = {}
  *  effect on every render (a fresh [] literal changes deps each time). */
 const NO_DIRS: string[] = []
 
+/** Staged attachments and folder references above the composer.
+ *
+ *  Every tile is a `role="group"` named by its FULL path. `title` shows that
+ *  path on pointer hover only — no browser opens a native tooltip on keyboard
+ *  focus — and a tile's visible text is the short label, so without the group
+ *  name the path reaches nobody using assistive technology. The name also tells
+ *  the per-tile controls apart: their labels are bare verbs ("Remove", "Remove
+ *  folder"), so with several files staged a screen reader announces each one
+ *  inside its own file's group instead of a row of identical buttons. */
 function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemoveDir, rootRef }: { files: string[]; dirs?: string[]; resizedInfo?: Record<string, ResizeInfo>; onRemove?: (path: string) => void; onRemoveDir?: (path: string) => void; rootRef?: (node: HTMLDivElement | null) => void }) {
   const [attachScroller, edges, remeasure] = useScrollEdges<HTMLDivElement>()
   // Chips are added and removed while the strip stays mounted (a paste, a
@@ -824,7 +833,7 @@ function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemo
         const src = `/api/file-raw?path=${encodeURIComponent(path)}`
         const resize = resizedInfo?.[path]
         return (
-          <div key={path} className="group/preview shrink-0 flex flex-col items-start gap-0.5" title={path}>
+          <div key={path} role="group" aria-label={path} className="group/preview shrink-0 flex flex-col items-start gap-0.5" title={path}>
             {/* The corner controls anchor to the IMAGE, not to the chip: the chip
                 is as wide as the wider of tile and resize pill, so a locale
                 whose pill is wider than the 64px tile (de: 104px pill) would
@@ -870,7 +879,7 @@ function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemo
         )
       })}
       {nonImgs.map(path => (
-        <div key={path} className="relative group/preview shrink-0 flex items-center gap-1.5 px-2 py-1 rounded border border-border bg-bg-hover text-[12px] text-text">
+        <div key={path} role="group" aria-label={path} title={path} className="relative group/preview shrink-0 flex items-center gap-1.5 px-2 py-1 rounded border border-border bg-bg-hover text-[12px] text-text">
           <span>{path.split('/').pop()}</span>
           {onRemove && (
             <button className="text-muted hover:text-danger cursor-pointer bg-transparent border-none p-0" onClick={() => onRemove(path)} title={i18nT('components.chatInput.remove')} aria-label={i18nT('components.chatInput.remove')}><X size={12} /></button>
@@ -891,6 +900,8 @@ function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemo
         <div
           key={path}
           data-dir-chip=""
+          role="group"
+          aria-label={path}
           title={path}
           className="relative group/preview shrink-0 flex items-center gap-1.5 px-2 py-1 rounded border border-border bg-bg-hover text-[12px] text-text"
         >
@@ -2114,6 +2125,22 @@ function ChatInput({
   // Refs keep the handler stable across re-renders while preserving state between keystrokes.
   const historyIdxRef = useRef(-1)
   const draftRef = useRef('')
+  /** The draft's paste blocks while a recalled history message is on screen.
+   *
+   *  A token pairs with its block by `seq` ALONE, and `nextSeq` restarts at 1
+   *  once a send clears the blocks, so a fresh draft's `[ Paste #1 ]` and the
+   *  `[ Paste #1 ]` text an older sent message kept are the same literal. Left
+   *  in scope, the draft's block would resolve against the recalled message's
+   *  token and expansion would splice the draft's content into a message the
+   *  user is about to send.
+   *
+   *  So the blocks travel with `draftRef` and ONLY with it: parked together when
+   *  a recall starts, restored together when the draft comes back, dropped
+   *  together when an edit discards the draft. Those three sites are the only
+   *  writers of either, which is what makes the pairing enumerable -- a guard on
+   *  "is history mode active" cannot hold, because editing the recalled text
+   *  clears that flag while the block is still in scope. */
+  const draftBlocksRef = useRef<PasteBlock[]>([])
   // Refs mirror frequently-changing props/state read from inside the keydown handler
   // so it doesn't re-create on every keystroke.
   const valueRef = useRef(value)
@@ -2379,10 +2406,13 @@ function ChatInput({
       setPathPickerOpen(false); setPathQuery('')
     }
     // Exit history mode when value diverges from the recalled message
-    // (user edited it, or the send pipeline cleared it).
+    // (user edited it, or the send pipeline cleared it). The draft is gone, so
+    // its parked blocks go with it — leaving them would let an edited recall
+    // resolve the draft's `[ Paste #N ]` against the message on screen.
     if (historyIdxRef.current !== -1 && value !== sentMessages?.[historyIdxRef.current]) {
       historyIdxRef.current = -1
       draftRef.current = ''
+      draftBlocksRef.current = []
     }
     prevValueRef.current = value
   }, [value, resetHeight, sentMessages])
@@ -2662,6 +2692,34 @@ function ChatInput({
     runOptimize({ prompt: txt, context, pastes, slotId })
   }, [runOptimize, chatMessages, pasteBlocks, slotId])
 
+  /** Replace a collapsed-paste token with its full content in the textarea and
+   *  drop the backing block. The caret lands just past the inserted content.
+   *
+   *  Every route reaches expansion through here -- mouse two-step, touch tap,
+   *  keyboard chord -- and none of them needs to ask whether a recalled message
+   *  is on screen. What keeps a draft's block away from another message's token
+   *  is SCOPE, not a flag: the blocks are parked with `draftRef` for the whole
+   *  time a recall owns the textarea (see draftBlocksRef). A flag would not
+   *  hold, because editing the recalled text clears history mode while the
+   *  colliding block is still live.
+   *
+   *  Declared above every caller, because a `useCallback` dependency list is
+   *  read during render, so a later `const` would be in its temporal dead zone
+   *  there. */
+  const expandTokenRange = useCallback((range: { start: number; end: number; block: PasteBlock }) => {
+    const expanded = value.slice(0, range.start) + range.block.content + value.slice(range.end)
+    onChange(expanded)
+    onPasteBlocksChange?.(pasteBlocks.filter(b => b.id !== range.block.id))
+    requestAnimationFrame(() => {
+      const ta = inputRef.current
+      if (ta) {
+        const pos = range.start + range.block.content.length
+        ta.setSelectionRange(pos, pos)
+        ta.focus()
+      }
+    })
+  }, [value, pasteBlocks, onPasteBlocksChange, onChange])
+
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // Cmd/Ctrl+Shift+V → next paste inserts full text inline (no chip collapse).
     // Self-clearing: any other keydown resets the flag so it only ever affects
@@ -2715,6 +2773,43 @@ function ChatInput({
       const se = ta.selectionEnd ?? 0
       const isCollapsed = ss === se
       const ranges = findTokenRanges(v, pasteBlocks)
+
+      // Alt+ArrowDown expands the collapsed-paste token the selection COVERS.
+      // This is the only keyboard route to expansion: the pointer routes below
+      // (mouse two-step click, touch tap) are unreachable without a pointer, and
+      // a native `title` never opens on focus.
+      //
+      // Select first, then expand -- the same two steps the mouse takes, and the
+      // reason is the same hazard. On macOS Option+ArrowDown IS native "move to
+      // paragraph end" navigation, and the caret is snapped out of token
+      // interiors so it parks on token EDGES; matching a bare caret would make
+      // ordinary navigation past a token expand it and drop the block. A
+      // selection is an act of intent that navigation never produces. Shift+
+      // ArrowRight (or Shift+ArrowLeft from the far edge) extends across a whole
+      // token in one step, so the selection this needs is one keypress away.
+      //
+      // The range EQUALITY below is what enforces that: a token range has
+      // start != end, so a collapsed caret can never satisfy it. `!isCollapsed`
+      // is a short-circuit for the common case, not the guard itself.
+      //
+      // The chord also stays out of the send key's namespace: `Enter` without
+      // Shift IS the send binding in the default mode. And it is not the paste
+      // key, because clipboard text is readable synchronously only inside a
+      // `paste` event, so a keydown handler cannot tell an expand press from a
+      // real paste without suppressing the paste it exists to preserve.
+      // Requires `onPasteBlocksChange`, the same gate the pointer routes use:
+      // expansion drops the backing block, and parking depends on the parent
+      // accepting that change, so without it there is no safe expansion at all.
+      if (e.key === 'ArrowDown' && e.altKey && !e.metaKey && !e.ctrlKey && !e.shiftKey && !isCollapsed && onPasteBlocksChange) {
+        const from = Math.min(ss, se)
+        const to = Math.max(ss, se)
+        const covered = ranges.find(r => r.start === from && r.end === to)
+        if (covered) {
+          e.preventDefault()
+          expandTokenRange(covered)
+          return
+        }
+      }
 
       const removeBlockAtom = (r: { start: number; end: number; block: PasteBlock }) => {
         e.preventDefault()
@@ -2952,8 +3047,12 @@ function ChatInput({
       if (!atStart && cur !== '') return
       const idx = historyIdxRef.current
       if (idx === -1) {
-        // Entering history mode — save current draft (may be empty).
+        // Entering history mode — save current draft (may be empty), and park
+        // its paste blocks with it so none of them can resolve against a token
+        // in the recalled text (see draftBlocksRef).
         draftRef.current = cur
+        draftBlocksRef.current = pasteBlocksRef.current
+        if (pasteBlocksRef.current.length) onPasteBlocksChange?.([])
         historyIdxRef.current = len - 1
         onChange(sentMessages[len - 1])
         moveCaretAfterRecall('start')
@@ -2976,15 +3075,18 @@ function ChatInput({
         onChange(sentMessages[idx + 1])
         moveCaretAfterRecall('end')
       } else {
-        // Past newest — restore draft and exit history mode.
+        // Past newest — restore draft and exit history mode. The parked blocks
+        // come back with it, so the draft's own tokens expand again.
         historyIdxRef.current = -1
         onChange(draftRef.current)
+        if (draftBlocksRef.current.length) onPasteBlocksChange?.(draftBlocksRef.current)
         draftRef.current = ''
+        draftBlocksRef.current = []
         moveCaretAfterRecall('end')
       }
       e.preventDefault()
     }
-  }, [fireComposer, onChange, sentMessages, sendOnEnter, pasteBlocks, onPasteBlocksChange, connected, ime, optimizePrompt, promptOptimizer])
+  }, [fireComposer, onChange, sentMessages, sendOnEnter, pasteBlocks, onPasteBlocksChange, connected, ime, optimizePrompt, promptOptimizer, expandTokenRange])
 
   /** Intercept clipboard paste — files go to upload path, big text gets collapsed into a token. */
   const handlePaste = useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
@@ -3093,27 +3195,12 @@ function ChatInput({
     }
   }, [onUploadFiles, onPasteBlocksChange, pasteBlocks, value, onChange, showFullPastes])
 
-  /** Replace a collapsed-paste token with its full content in the textarea and
-   *  drop the backing block. The caret lands just past the inserted content. */
-  const expandTokenRange = useCallback((range: { start: number; end: number; block: PasteBlock }) => {
-    const expanded = value.slice(0, range.start) + range.block.content + value.slice(range.end)
-    onChange(expanded)
-    onPasteBlocksChange?.(pasteBlocks.filter(b => b.id !== range.block.id))
-    requestAnimationFrame(() => {
-      const ta = inputRef.current
-      if (ta) {
-        const pos = range.start + range.block.content.length
-        ta.setSelectionRange(pos, pos)
-        ta.focus()
-      }
-    })
-  }, [value, pasteBlocks, onPasteBlocksChange, onChange])
-
   /** Click/tap on a collapsed-paste token expands it to the original full
    *  content in the textarea.
    *
-   *  Two gestures reach expansion, because a single gesture cannot serve both
-   *  pointer classes:
+   *  Two POINTER gestures reach expansion from here, because a single gesture
+   *  cannot serve both pointer classes (the keyboard route is Alt+ArrowDown, in
+   *  `handleKeyDown`):
    *   - Mouse: a two-step click — 1st click (detail=1) selects the token as a
    *     range (visual highlight), a quick 2nd click (detail>=2, the browser's
    *     own double-click) expands. `event.detail` is the click count the
