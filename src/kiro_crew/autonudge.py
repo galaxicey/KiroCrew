@@ -6402,6 +6402,25 @@ class AutoNudgeService:
                 # of the wording, so the honest answer is not to guess it but to
                 # bound how long any loop can go undelivered.
                 monitor.quiet_streak = 0
+                # This branch FIRES, so a judge row from this tick claiming to have
+                # withheld the turn is wrong: left standing it takes a ``missed`` label
+                # from the next delivery for a tick that actually spent its turn, which
+                # is a wrong row in the calibration log. Withdrawing the claim returns
+                # the row to the undecided state the fire path stamps, the same
+                # correction the judge's own persist-failure path makes.
+                #
+                # The two streaks are independent fields, which is what makes this
+                # reachable: a gated loop whose judge arms mid-life climbs to the
+                # probe's floor with the judge's own streak still below its floor.
+                #
+                # Guarded on ``judged`` because ``True`` is the one answer that means
+                # this tick recorded a suppressed row and left it standing. ``None``
+                # means no lane is armed for this loop, so nothing was asked and the
+                # newest row belongs to an earlier tick -- clearing that one would
+                # withdraw a suppression that is true and hand that verdict the actions
+                # of whatever turn this fire produces.
+                if judged is True:
+                    self._withdraw_judge_suppression(loop)
                 # NOT charged here, for the same reason the WAKE branch is not: this
                 # tick has decided to deliver but has not delivered, and the fire can
                 # still be refused by a busy slot. Charging now would report a turn
