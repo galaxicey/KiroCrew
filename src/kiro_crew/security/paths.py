@@ -647,13 +647,16 @@ _CREW_SECRET_LEAVES: list[str] = [
     # grant an agent could write is not merely a feature it turns on for itself, it is the
     # removal of the approval step that would have caught everything else it does next.
     # It is here rather than in ``config.json`` because that document sits off this floor
-    # on purpose (reading config in-sandbox is routine), which leaves it only a read-only
-    # seal, and a seal covers a path while the inode behind it stays reachable under a
-    # second name in a writable root. This leaf has NO in-sandbox reader at all -- the
+    # on purpose (reading config in-sandbox is routine) and is not sealed either, since an
+    # in-sandbox ``kirocrew config set`` is a documented verb -- so no path-based control
+    # refuses a shell write to it. A seal would not have sufficed anyway: it covers a path
+    # while the inode behind it stays reachable under a second name in a writable root.
+    # This leaf has NO in-sandbox reader at all -- the
     # gateway process is the only party that consults it -- so it is also bind-masked in
     # ``sandbox._CREW_HIDDEN_LEAVES``, and the mask is what makes the name unopenable
-    # rather than merely unwritable. The operator writes it out-of-band, the same
-    # arrangement as ``oauth_endpoints.json``.
+    # rather than merely unwritable. The sole writer is ``kirocrew security
+    # standing-approval --enable``, running as the gateway's own user: the document carries
+    # a provenance ``mac`` over the host signing secret, so a hand-written file is refused.
     "standing_approval.json",
     # Where that grant's absent-equivalent document is staged before being linked into
     # place. A whole DIRECTORY, because the temp's inode BECOMES the grant: a visible temp

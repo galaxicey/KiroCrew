@@ -229,6 +229,35 @@ class TestTheStandingGrantLivesOnAnUnopenableLeaf:
 
         assert so_mod.standing_grant_declared() is False
 
+    def test_a_non_ascii_provenance_answers_no_grant_instead_of_raising(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # ``hmac.compare_digest`` refuses two ``str`` arguments when either holds a
+        # non-ASCII character and raises TypeError rather than answering False. This
+        # reader's contract is to fail soft to NO GRANT in every direction, and both
+        # callers reach it through an unguarded ``to_thread``, so a raise here would abort
+        # gateway startup on a document the MAC check exists to refuse.
+        from kiro_crew import safety_override as so_mod
+
+        target = tmp_path / self.LEAF
+        target.write_text('{"enabled": true, "mac": "caf\u00e9"}', encoding="utf-8")
+        monkeypatch.setattr(so_mod, "standing_approval_path", lambda: target)
+
+        assert so_mod.standing_grant_declared() is False
+
+    def test_a_lone_surrogate_provenance_answers_no_grant_instead_of_raising(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # ``json.loads`` accepts a lone surrogate, which plain utf-8 encoding then refuses;
+        # ``surrogatepass`` is why this decodes to a comparison rather than an exception.
+        from kiro_crew import safety_override as so_mod
+
+        target = tmp_path / self.LEAF
+        target.write_text('{"enabled": true, "mac": "\\ud800"}', encoding="utf-8")
+        monkeypatch.setattr(so_mod, "standing_approval_path", lambda: target)
+
+        assert so_mod.standing_grant_declared() is False
+
     def test_a_mac_minted_for_the_off_posture_does_not_grant(self, tmp_path, monkeypatch) -> None:
         # The MAC covers the DECISION, so one minted for `false` cannot be carried onto a
         # document claiming `true`.
@@ -289,6 +318,7 @@ class TestTheStandingGrantLivesOnAnUnopenableLeaf:
         monkeypatch.setattr(loader_mod, "standing_approval_path", lambda: target)
         monkeypatch.setattr(so_mod, "standing_approval_path", lambda: target)
         monkeypatch.setattr(cli_commands, "_standing_grant_key_is_persisted", lambda: False)
+        monkeypatch.setattr(cli_commands, "standing_approval_path", lambda: target)
 
         cli_commands._standing_approval(argparse.Namespace(enable=True, disable=False))
 
@@ -306,6 +336,7 @@ class TestTheStandingGrantLivesOnAnUnopenableLeaf:
         target = tmp_path / self.LEAF
         target.mkdir()
         monkeypatch.setattr(loader_mod, "standing_approval_path", lambda: target)
+        monkeypatch.setattr(cli_commands, "standing_approval_path", lambda: target)
 
         cli_commands._standing_approval(argparse.Namespace(enable=False, disable=True))
 
@@ -339,6 +370,10 @@ class TestTheStandingGrantLivesOnAnUnopenableLeaf:
         # The key check has its own pin; the host secret is memoized process-wide, so
         # leaving it live here would make this test depend on which home loaded it first.
         monkeypatch.setattr(cli_commands, "_standing_grant_key_is_persisted", lambda: True)
+        # The verb holds its own module-scope reference, so the reader's copy is not the one
+        # it resolves. Production is unaffected: the bound function still reads
+        # ``KIROCREW_HOME`` on every call, and nothing reassigns it outside a test.
+        monkeypatch.setattr(cli_commands, "standing_approval_path", lambda: target)
 
         cli_commands._standing_approval(argparse.Namespace(enable=True, disable=False))
         assert so_mod.standing_grant_declared() is True

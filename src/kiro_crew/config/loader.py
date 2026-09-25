@@ -1118,20 +1118,25 @@ def standing_approval_path() -> Path:
     remove the approval step that would have caught everything it did next.
 
     Deliberately NOT a key in ``config.json``. That document is off the read+write
-    floor on purpose, because reading config in-sandbox is routine, which leaves it
-    only the OS sandbox's read-only seal -- and a seal covers a PATH while the inode
-    behind it stays reachable under a second name in a writable root. This leaf is
+    floor on purpose, because reading config in-sandbox is routine, and it is not
+    sealed either -- an in-sandbox ``kirocrew config set`` is a documented verb, and a
+    seal would break it -- so NO path-based control refuses a shell write to it. Even
+    a seal would not have been enough: it covers a PATH while the inode behind it
+    stays reachable under a second name in a writable root. This leaf is
     bind-MASKED in ``sandbox._CREW_HIDDEN_LEAVES`` instead, so the name cannot be
     opened at all from a sandbox, and masking is available here for a reason that does
     not hold for ``config.json``: nothing in-sandbox reads this document, while the
     config document is resolved per call by the subagent cap, the quarantine threshold
     and the browser and monitoring paths.
 
-    Holds ``{"enabled": bool}``; every read fails soft to NO GRANT (see
-    ``safety_override.standing_grant_declared``) -- absent, unreadable, malformed and
-    ``false`` all answer the same way. There is no dashboard writer: the operator
-    hand-edits the file out-of-band, the same arrangement as
-    :func:`oauth_endpoints_path`. Respects ``KIROCREW_HOME``.
+    Holds ``{"enabled": bool, "mac": str}``; every read fails soft to NO GRANT (see
+    ``safety_override.standing_grant_declared``) -- absent, unreadable, malformed,
+    ``false`` and an unverified ``mac`` all answer the same way. The sole writer is
+    ``kirocrew security standing-approval --enable``, which runs as the gateway's own
+    user because minting ``mac`` needs the host signing secret. A hand-written
+    document is refused for want of a valid ``mac``: an operator cannot compute one,
+    which is what keeps a sandboxed process from producing this file. Respects
+    ``KIROCREW_HOME``.
     """
     return config_dir() / "standing_approval.json"
 

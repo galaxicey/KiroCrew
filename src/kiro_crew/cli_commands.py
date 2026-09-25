@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import contextlib
 import dataclasses
+import hmac
 import importlib
 import importlib.util
 import inspect
@@ -16,6 +17,7 @@ import re
 import shutil
 import stat
 import sys
+import tempfile
 import time as _time
 import traceback
 import urllib.error
@@ -54,6 +56,7 @@ from kiro_crew.apps.plugin_import import (
     read_manifest_name,
 )
 from kiro_crew.apps.scaffold import scaffold_app
+from kiro_crew.atomic_write import fsync_dir
 from kiro_crew.cli_server import _marker_port, resolve_client_port
 from kiro_crew.config import config_dir
 from kiro_crew.config.loader import (
@@ -69,6 +72,7 @@ from kiro_crew.config.loader import (
     materialize_workspace_dir,
     read_config_for_update,
     read_local_secret,
+    standing_approval_path,
     update_config_locked,
 )
 from kiro_crew.cron import (
@@ -85,7 +89,7 @@ from kiro_crew.cron import (
 )
 from kiro_crew.cron_script import resolve_script_path
 from kiro_crew.cron_trigger import trigger_cron_job
-from kiro_crew.dashboard import tailnet, tailnet_serve
+from kiro_crew.dashboard import tailnet, tailnet_serve, token_secret
 from kiro_crew.dashboard.origin import parse_dashboard_url
 from kiro_crew.embeddings import (
     get_shared_embedder,
@@ -124,6 +128,8 @@ from kiro_crew.memory_stores import (
 from kiro_crew.platform import redact_log_via_context
 from kiro_crew.port_resolution import resolve_client_port_ex
 from kiro_crew.project_scope import scope_is_admissible, scope_selector_is_inadmissible
+from kiro_crew.safety_override import standing_grant_mac
+from kiro_crew.sandbox import _STANDING_APPROVAL_STAGING_LEAF
 from kiro_crew.secrets.migrate import (
     MigrationConflictError,
     format_report,
@@ -2175,11 +2181,6 @@ def _publish_standing_grant(path: "Path", document: dict) -> bool:
     fail-closed direction: no grant rather than one published through a path whose shape is
     not what it is supposed to be.
     """
-    import tempfile
-
-    from kiro_crew.atomic_write import fsync_dir
-    from kiro_crew.sandbox import _STANDING_APPROVAL_STAGING_LEAF
-
     staging = config_dir() / _STANDING_APPROVAL_STAGING_LEAF
     staging.mkdir(parents=True, mode=0o700, exist_ok=True)
     if not staging.is_dir() or staging.is_symlink():
@@ -2220,10 +2221,6 @@ def _standing_grant_key_is_persisted() -> bool:
     the degradation is what has to be detected and a flag would have to be kept in sync
     with every path that degrades.
     """
-    import hmac
-
-    from kiro_crew.dashboard import token_secret
-
     # ``_get_secret()`` FIRST, because on a fresh install it is what CREATES the key file:
     # reading the path before that would find nothing and report an ephemeral secret for
     # every first run, refusing a grant the host can perfectly well verify.
@@ -2257,10 +2254,6 @@ def _standing_approval(args: argparse.Namespace) -> None:
     the sink is down would keep alive an authorization the operator has asked to end, which
     is the wrong direction to fail in.
     """
-    from kiro_crew.atomic_write import fsync_dir
-    from kiro_crew.config.loader import standing_approval_path
-    from kiro_crew.safety_override import standing_grant_mac
-
     path = standing_approval_path()
     if getattr(args, "disable", False):
         try:

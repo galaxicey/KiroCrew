@@ -2322,7 +2322,13 @@ def standing_grant_declared() -> bool:
             path,
         )
         return False
-    if not hmac.compare_digest(mac, expected):
+    # Compare BYTES. ``hmac.compare_digest`` refuses two ``str`` arguments when either
+    # holds a non-ASCII character, and raises ``TypeError`` rather than answering False.
+    # ``mac`` is untrusted text out of a JSON document, so a planted "caf\u00e9" would
+    # escape a function whose contract is to fail soft to NO GRANT and would abort gateway
+    # startup through the two ``to_thread`` callers. ``surrogatepass`` covers the lone
+    # surrogate ``json.loads`` accepts; ``expected`` is a hexdigest, hence ASCII.
+    if not hmac.compare_digest(mac.encode("utf-8", "surrogatepass"), expected.encode("ascii")):
         logger.warning(
             "Standing auto-approve grant at %s does not verify against this installation; "
             "treating it as no grant. Record it with: kirocrew security standing-approval "

@@ -249,8 +249,10 @@ _LIVE_TARGET_STAGING_LEAF: str = "live-target-staging"
 #: document decides whether one session's elevation is the host's default.
 #:
 #: Not a key in ``config.json``. That document is off the read+write floor on purpose,
-#: because reading config in-sandbox is routine, so the only protection available to it
-#: is a read-only seal -- and a seal covers a PATH, not the inode behind it, while the
+#: because reading config in-sandbox is routine, and it is not sealed either, since an
+#: in-sandbox ``kirocrew config set`` is a documented verb -- so no path-based control
+#: refuses a shell write to it. A seal would not have sufficed anyway: it covers a PATH,
+#: not the inode behind it, while the
 #: data-home root stays writable. A second name to that inode therefore remains a way to
 #: write the posture. This leaf is MASKED instead, which is the placement that answers
 #: both halves: an agent cannot open it, so it can neither read the grant nor obtain a
