@@ -245,3 +245,102 @@ def test_inbound_ungoverned_permit_survives_audit_failure(monkeypatch, tmp_path)
         assert asyncio.run(identity.channel_inbound_permitted("discord")) is True
     finally:
         gp.reset_store()
+
+
+# ── Outbound channels-governance gate (a send is not a received message) ──
+
+
+def test_outbound_permitted_when_no_policy(monkeypatch, tmp_path) -> None:
+    # Default OSS build: no channels policy → every transport's outbound permits,
+    # so sends are byte-identical to a build without this gate.
+    from kiro_crew.platform import governance_profiles as gp
+
+    monkeypatch.setattr(gp, "_PROFILES_DIR", tmp_path / "profiles")
+    gp.reset_store()
+    try:
+        assert asyncio.run(identity.channel_outbound_permitted("discord")) is True
+        assert asyncio.run(identity.channel_outbound_permitted("telegram")) is True
+    finally:
+        gp.reset_store()
+
+
+def test_outbound_fail_closed_on_governance_error(monkeypatch) -> None:
+    # The caller is about to write to a destination whose standing it cannot
+    # establish, so an evaluation error DENIES.
+    def _boom(*_a, **_k):
+        raise RuntimeError("evaluation glitch")
+
+    monkeypatch.setattr("kiro_crew.messaging.identity.governance_permits", _boom)
+    assert asyncio.run(identity.channel_outbound_permitted("discord")) is False
+
+
+def test_outbound_reraises_platform_composition_error(monkeypatch) -> None:
+    # Matches the inbound sibling and the host gate: a broken composition surfaces.
+    from kiro_crew.platform.context import PlatformCompositionError
+
+    def _boom(*_a, **_k):
+        raise PlatformCompositionError("companion mismatch")
+
+    monkeypatch.setattr("kiro_crew.messaging.identity.governance_permits", _boom)
+    import pytest
+
+    with pytest.raises(PlatformCompositionError):
+        asyncio.run(identity.channel_outbound_permitted("discord"))
+
+
+def _decision(permitted: bool, layer: str):
+    return type("_D", (), {"permitted": permitted, "layer": layer, "rule": "r", "reason": "why"})()
+
+
+def test_outbound_rows_name_the_outbound_direction(monkeypatch) -> None:
+    # A send filed under an ingress name is unreadable to whoever later asks why a
+    # message did not go out, so the direction is part of the record.
+    rows: list[dict] = []
+
+    class _Sel:
+        def log_governance_decision(self, **kw):
+            rows.append(kw)
+
+    monkeypatch.setattr("kiro_crew.messaging.identity.sel", lambda: _Sel())
+    monkeypatch.setattr(
+        "kiro_crew.messaging.identity.governance_permits",
+        lambda *a, **k: _decision(False, "policy"),
+    )
+    assert asyncio.run(identity.channel_outbound_permitted("discord")) is False
+    assert [r["tool_name"] for r in rows] == ["outbound:discord"]
+    assert rows[0]["outcome"] == "denied"
+
+
+def test_an_unwritable_audit_store_does_not_fail_a_permitted_send(monkeypatch) -> None:
+    # The send is already composed and mid-flight and its admission was decided at
+    # the chokepoint, so audit-store disk health must not become a delivery
+    # dependency on the retry path. The DECISION still fails closed; only this
+    # write is best-effort.
+    class _Sel:
+        def log_governance_decision(self, **kw):
+            raise OSError("read-only file system")
+
+    monkeypatch.setattr("kiro_crew.messaging.identity.sel", lambda: _Sel())
+    monkeypatch.setattr(
+        "kiro_crew.messaging.identity.governance_permits",
+        lambda *a, **k: _decision(True, "policy"),
+    )
+    assert asyncio.run(identity.channel_outbound_permitted("discord")) is True
+
+
+def test_an_ungoverned_outbound_allow_writes_no_row(monkeypatch) -> None:
+    # Nothing was governed, so there is no decision to record, and a row per send
+    # on an install with no policy would be hot-path write amplification.
+    rows: list[dict] = []
+
+    class _Sel:
+        def log_governance_decision(self, **kw):
+            rows.append(kw)
+
+    monkeypatch.setattr("kiro_crew.messaging.identity.sel", lambda: _Sel())
+    monkeypatch.setattr(
+        "kiro_crew.messaging.identity.governance_permits",
+        lambda *a, **k: _decision(True, ""),
+    )
+    assert asyncio.run(identity.channel_outbound_permitted("discord")) is True
+    assert rows == []
