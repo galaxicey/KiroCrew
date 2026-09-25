@@ -10,7 +10,6 @@ import {
   Copy,
   Download,
   ExternalLink,
-  LogIn,
   Package,
   RefreshCw,
   ShieldCheck,
@@ -1524,7 +1523,7 @@ export default function KiroPrerequisiteGate({ children }: { children: ReactNode
             </p>
           </div>
 
-          <Card className={!status.installed ? 'border-accent/60 shadow-[0_10px_35px_var(--accent-glow)]' : ''}>
+          <Card className="border-accent/60 shadow-[0_10px_35px_var(--accent-glow)]">
             <div className="flex items-start justify-between gap-4">
               <div>
                 <h2 className="flex items-center gap-2 text-base font-semibold text-text-strong">
@@ -1535,11 +1534,11 @@ export default function KiroPrerequisiteGate({ children }: { children: ReactNode
                 </h2>
                 <p className="mt-2 text-sm leading-relaxed text-muted">
                   {status.installed
-                    ? i18nT('components.kiroPrerequisiteGate.kiro_cli_was_found_on_this_host')
+                    ? i18nT('components.kiroPrerequisiteGate.sign_in_with_kiro_cli_on_the_gateway_host')
                     : i18nT('components.kiroPrerequisiteGate.kiro_cli_is_not_installed_yet')}
                 </p>
               </div>
-              <StepStatus complete={status.installed} current={!status.installed} />
+              <StepStatus complete={false} current />
             </div>
             {/* The one-line installer is SHOWN, never run: Kiro Crew does not
                 install Kiro CLI. The setup page stays as the route for every
@@ -1562,41 +1561,20 @@ export default function KiroPrerequisiteGate({ children }: { children: ReactNode
                 </p>
               </div>
             )}
-          </Card>
+            {/* No separate sign-in step: until Kiro CLI exists there is nothing
+                to sign into, so the screen does not ask for it. Once installed
+                but signed out, the same card swaps its installer for the
+                sign-in commands, so that state still says what to run.
 
-          <Card className={status.installed && !status.authenticated ? 'border-accent/60 shadow-[0_10px_35px_var(--accent-glow)]' : ''}>
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <h2 className="flex items-center gap-2 text-base font-semibold text-text-strong">
-                  <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent-subtle text-accent">
-                    <LogIn className="lucide-inline" />
-                  </span>
-                  {i18nT('components.kiroPrerequisiteGate.sign_in_to_kiro')}
-                </h2>
-                <p className="mt-2 text-sm leading-relaxed text-muted">
-                  {status.authenticated
-                    ? i18nT('components.kiroPrerequisiteGate.this_kiro_cli_is_signed_in')
-                    : i18nT('components.kiroPrerequisiteGate.sign_in_with_kiro_cli_on_the_gateway_host')}
-                </p>
-              </div>
-              <StepStatus
-                complete={status.authenticated}
-                current={status.installed && !status.authenticated}
-              />
-            </div>
-            {/* Rendered VERBATIM from the backend constants, never catalog
-                values: a translated command cannot be typed. Shown only once a CLI
-                exists to sign into — before that the step above owns the screen.
-                Kiro Crew does not run them; the footer's Check again reads the
-                result.
+                Rendered VERBATIM from the backend constants, never catalog
+                values: a translated command cannot be typed. Kiro Crew does not
+                run them; the footer's Check again reads the result.
 
                 BOTH tiers are offered, because the sign-in page the bare command
                 opens presents a free Builder ID as a peer of organization SSO:
                 a user on an SSO plan who picks the wrong one authenticates
                 successfully and only discovers the mismatch later, as missing
-                models. Naming the tier here makes it a decision instead of a
-                guess. Kiro Crew does not detect which one applies — that would
-                mean inspecting the host's identity configuration — so the copy
+                models. Kiro Crew does not detect which one applies, so the copy
                 describes the choice and lets the user make it. */}
             {status.installed && !status.authenticated && (
               <div className="mt-4 space-y-4">

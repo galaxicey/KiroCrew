@@ -1364,6 +1364,23 @@ describe('KiroPrerequisiteGate agent choice', () => {
     expect(screen.queryByRole('button', { name: /Install Kiro CLI/ })).not.toBeInTheDocument()
   })
 
+  it('has no separate sign-in step: the Kiro CLI card carries sign-in once installed', async () => {
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status())
+    const first = render()
+    await screen.findByText(/Run this on the Linux gateway host/)
+    expect(screen.queryByRole('heading', { name: 'Sign in to Kiro' })).not.toBeInTheDocument()
+    expect(screen.queryByText('kiro-cli login')).not.toBeInTheDocument()
+    first.unmount()
+
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({ installed: true }))
+    render()
+    const card = (await screen.findByRole('heading', { name: 'Get Kiro CLI' })).closest('div.card-glow')
+    expect(card).not.toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Sign in to Kiro' })).not.toBeInTheDocument()
+    expect(within(card as HTMLElement).getByText('kiro-cli login')).toBeInTheDocument()
+    expect(within(card as HTMLElement).queryByText(/cli\.kiro\.dev\/install/)).not.toBeInTheDocument()
+  })
+
   it('shows the PowerShell installer for a Windows host only', async () => {
     vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({ platform: 'Windows' }))
     render()
