@@ -9940,7 +9940,13 @@ function ChatSidebar({
                       // order. Cross-lane card drag (the column onDrop above) is
                       // untouched; only folder rendering (and with it folder
                       // reorder/drop, which need folder headers) goes away.
-                      const relevantFolders = flatView ? [] : rootFolders
+                      // A folder the person unchecked in the filter menu drops out here
+                      // for the same reason the tree drops it: the hide is a statement
+                      // about the folder, not about one lane, so every lane that renders
+                      // folder blocks answers to it. `isFolderHidden` is deliberately NOT
+                      // applied -- a board column renders an empty folder header on
+                      // purpose, as something to drop onto.
+                      const relevantFolders = flatView ? [] : rootFolders.filter(f => !isFolderFilteredOut(f))
                       const { rows: ungrouped, navScope: colLaneScope, container: colHoldContainer } = heldLane(flatView
                         ? colSlots
                         : colSlots.filter(s => {
