@@ -5360,7 +5360,23 @@
         "probe_failing": "Failing",
         "probe_failing_help": "{{failures}} consecutive probes failed. The server is still mounted; this is a health reading, not a change.",
         "reset_failures": "Reset count",
-        "reset_failures_help": "Clear the consecutive-failure count for this server."
+        "reset_failures_help": "Clear the consecutive-failure count for this server.",
+        "disabled_in_config": "Disabled in config",
+        "disabled_in_config_invalid": "Config error",
+        "status_invalid_value": "Invalid value",
+        "copy_path": "Copy path",
+        "copy_path_named": "Copy the path {{file}}",
+        "path_copied": "Copied",
+        "copy_path_failed": "Copy failed",
+        "disabled_in_config_help": "Disabled in the shared Kiro MCP config, which the Kiro IDE also reads. It is never started, and this panel cannot re-enable it: change the flag in that config.",
+        "disabled_in_config_where": "Disabled in <file>{{file}}</file>. Editing this file lifts its disable; another config may still keep the server off. A switch is planned.",
+        "disabled_in_config_where_unknown": "Disabled in the shared MCP config. Editing that config lifts its disable; another config may still keep the server off. A switch is planned.",
+        "disabled_in_config_invalid_where": "Disabled: invalid \"disabled\" value in <file>{{file}}</file>. Set it to true or false there.",
+        "disabled_in_config_invalid_where_unknown": "Disabled: invalid \"disabled\" value in the shared MCP config. Set it to true or false there.",
+        "uninstall_disabled_in_config_help": "Removes this server from every MCP config, including the shared one it is disabled in.",
+        "scope_disabled_in_config": "{{label}}: off (disabled in the shared MCP config; change it there)",
+        "disabled_count_one": "{{count}} disabled",
+        "disabled_count_other": "{{count}} disabled"
       },
       "memoryGraphTab": {
         "all_count": "All ({{count}})",
@@ -6240,6 +6256,11 @@
         "terminal_completion_desc": "Show the completion popup while typing in the Terminal. Enter runs the line you typed; to take a suggestion, press ↑/↓ then Enter, or Tab. Off hides the popup; your shell's own Tab completion still works.",
         "terminal_completion_save_failed": "Could not save the command completion setting",
         "config_load_failed": "Could not load the saved display settings. The shell, recent-session and command completion settings are unavailable until it loads.",
+        "installed_themes_load_failed": "Could not load the theme list; retrying automatically. Until it loads, an installed theme cannot be selected or applied.",
+        "installed_themes_refresh_failed": "Could not refresh the theme list. It is out of date.",
+        "installed_themes_refresh_failed_after_install": "The theme was installed, but the theme list could not be refreshed. Press Retry to refresh the list and apply it, or pick it from the theme list once it refreshes.",
+        "retry_theme_list": "Retry",
+        "retrying_theme_list": "Retrying…",
         "recent_tint_save_failed": "Could not save the recent-session highlight count."
       },
       "instancesPanel": {
