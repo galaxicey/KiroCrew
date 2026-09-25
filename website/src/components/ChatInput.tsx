@@ -2748,19 +2748,25 @@ function ChatInput({
       const isCollapsed = ss === se
       const ranges = findTokenRanges(v, pasteBlocks)
 
-      // Alt+Enter with the caret on a collapsed-paste token expands it in
-      // place. This is the ONLY keyboard route to expansion: the pointer
-      // routes below (mouse two-step click, touch tap) are unreachable
-      // without a pointer, and a native `title` never opens on focus. The
-      // chord is deliberately not the paste key — clipboard text is readable
-      // synchronously only inside a `paste` event, so a keydown handler cannot
-      // tell an "expand" press from a real paste without suppressing the paste
-      // it exists to preserve. It runs here, ahead of the Enter/send branches,
-      // so Alt+Enter on a token never also sends the message.
+      // Alt+ArrowDown with the caret on a collapsed-paste token expands it in
+      // place. This is the ONLY keyboard route to expansion: the pointer routes
+      // below (mouse two-step click, touch tap) are unreachable without a
+      // pointer, and a native `title` never opens on focus.
+      //
+      // The chord sits outside the send key's namespace on purpose. `Enter`
+      // without Shift IS the send binding in the default mode, so an Alt+Enter
+      // chord would take a key that already sends the message and give it a
+      // second meaning wherever the caret happened to rest. Alt+ArrowDown is
+      // the platform's "open what is here" idiom and, off a token, keeps
+      // whatever ArrowDown already does. It is not the paste key either:
+      // clipboard text is readable synchronously only inside a `paste` event,
+      // so a keydown handler cannot tell an "expand" press from a real paste
+      // without suppressing the paste it exists to preserve.
+      //
       // `tokenRangeAt` is edge-inclusive, which is what makes this reachable:
       // the caret is snapped out of token interiors, so a keyboard caret only
       // ever rests on a token's boundary.
-      if (e.key === 'Enter' && e.altKey && !e.metaKey && !e.ctrlKey && !e.shiftKey) {
+      if (e.key === 'ArrowDown' && e.altKey && !e.metaKey && !e.ctrlKey && !e.shiftKey) {
         const onToken = tokenRangeAt(v, pasteBlocks, ss)
         if (onToken) {
           e.preventDefault()
@@ -3150,7 +3156,7 @@ function ChatInput({
    *  content in the textarea.
    *
    *  Two POINTER gestures reach expansion from here, because a single gesture
-   *  cannot serve both pointer classes (the keyboard route is Alt+Enter, in
+   *  cannot serve both pointer classes (the keyboard route is Alt+ArrowDown, in
    *  `handleKeyDown`):
    *   - Mouse: a two-step click — 1st click (detail=1) selects the token as a
    *     range (visual highlight), a quick 2nd click (detail>=2, the browser's

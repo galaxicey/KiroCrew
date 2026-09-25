@@ -386,11 +386,15 @@ function DirChip({ label, fullPath, onOpen }: { label: string; fullPath: string;
   if (!onOpen) {
     return (
       // `title` reaches a pointer only, and the visible text is just the short
-      // label, so the accessible name carries the full path — the same
-      // role+aria-label naming FileHeaderBreadcrumb uses. The path IS runtime
-      // data, so no localized string is involved.
-      <span role="group" aria-label={fullPath} className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5 rounded border border-accent/25 bg-accent/10 text-accent text-[12px] font-mono" title={fullPath}>
-        {body}
+      // label, so the full path is also carried as visually-hidden text. A
+      // screen reader reads it wherever it reads the chip, including browse
+      // mode. It is text rather than a name on the span, because naming needs a
+      // role and a named non-interactive role is announced reliably only once
+      // something moves focus into it -- which nothing here ever does, since an
+      // inert chip has no action to reach and the transcript must not grow a tab
+      // stop per chip. FileHeaderBreadcrumb names a FOCUSABLE region instead.
+      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5 rounded border border-accent/25 bg-accent/10 text-accent text-[12px] font-mono" title={fullPath}>
+        {body}<span className="sr-only">{' '}{fullPath}</span>
       </span>
     )
   }
@@ -476,8 +480,8 @@ function FileMentionChip({ label, fullPath, onOpen }: { label: string; fullPath:
   const base = 'inline-flex items-center px-1.5 py-0.5 mx-0.5 rounded bg-accent/15 text-accent text-[12px] font-mono'
   if (!onOpen) {
     // Same reason as DirChip's inert branch: `title` is pointer-only, so the
-    // full path also becomes this chip's accessible name.
-    return <span role="group" aria-label={fullPath} className={base} title={fullPath}>@{label}</span>
+    // full path rides along as visually-hidden text.
+    return <span className={base} title={fullPath}>@{label}<span className="sr-only">{' '}{fullPath}</span></span>
   }
   return (
     <Clickable className={`${base} cursor-pointer hover:bg-accent/25 transition-colors`} title={fullPath} onClick={() => onOpen(fullPath)} aria-label={i18nT('pages.chatPage.open_file', { path: fullPath })}>@{label}</Clickable>
@@ -500,10 +504,11 @@ function FileAttachmentCard({ fullPath, label, onFileOpen }: { fullPath: string;
   if (!onFileOpen) {
     // The tooltip says WHERE the file opens, because the card looks exactly
     // like the main chat's clickable one and a click here answers nothing.
-    // The same sentence is the accessible name: `title` opens on pointer hover
-    // only, and the card's visible text is the short label alone.
+    // The same sentence rides along as visually-hidden text, since `title`
+    // opens on pointer hover only. The short label stays first, so the card's
+    // identity is read before the explanation.
     const inert = i18nT('pages.chatPage.attached_file_inert', { path: fullPath })
-    return <span role="group" aria-label={inert} className={base} title={inert}>{body}</span>
+    return <span className={base} title={inert}>{body}<span className="sr-only">{' '}{inert}</span></span>
   }
   return (
     <Clickable
