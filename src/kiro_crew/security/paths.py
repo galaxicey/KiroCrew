@@ -305,6 +305,10 @@ _CREW_SECRET_LEAVES: list[str] = [
     # its own poisoned clone. Masked at OS level too (`sandbox._CREW_HIDDEN_LEAVES`), since a
     # spawned shell's `open()` never routes through this gate.
     "quarantined-clones",
+    # Transcript metadata is agent-writable; these gateway-authored markers
+    # alone may authorize a nonstandard effort level during cold restore.
+    # Fence the entire directory from agent file tools, including writes.
+    "validated_effort_levels",
     "browser-cookies.txt",
     "playwright-storage-state.json",
     # The refused-inbound spool (messaging/inbound_spool.py). Not a secret: it is

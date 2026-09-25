@@ -306,6 +306,10 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # and a marker under `apps/auto-improvement/data/` would sit below a directory an agent
     # can rename out from under the mount.
     "quarantined-clones",
+    # Gateway-validated ACP effort markers authorize restored selections.
+    # A sandboxed agent may edit its transcript, so it must not write the
+    # corroborating marker too. Mask the whole directory, including new files.
+    "validated_effort_levels",
     "apps/meetings/data/edits",
     "whatsapp",
     # The refused-inbound spool. Fenced from agent FILE TOOLS by
@@ -1552,6 +1556,9 @@ _CREW_PRECREATE_HIDDEN_DIR_LEAVES: tuple[str, ...] = (
     "file-delivery-consent-pending",
     "appearance-library",
     "quarantined-clones",
+    # Precreate before a session starts so a first selected ACP level cannot
+    # materialize this directory inside an already-running sandbox.
+    "validated_effort_levels",
     # md-notebook's write-staging directory, for the same reason and by the same rule: a
     # direct child of the data home, so the plain ``mkdir`` above is sound. Left to lazy
     # creation, a sandbox spawned before the first state write finds it absent, the

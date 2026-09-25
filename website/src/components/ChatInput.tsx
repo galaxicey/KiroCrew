@@ -1,6 +1,6 @@
 import { Component, useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useId, memo, lazy, Suspense } from 'react'
 import { markComposerResize } from '../utils/composerResize'
-import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Mic, MicOff, Keyboard, Square, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, PenLine, ChevronsDownUp, ChevronsUpDown, MoreHorizontal } from 'lucide-react'
+import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, BrainCircuit, Mic, MicOff, Keyboard, Square, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, PenLine, ChevronsDownUp, ChevronsUpDown, MoreHorizontal } from 'lucide-react'
 import SketchDialog from './SketchDialog'
 import AppIcon from './AppIcon'
 import CopyBranchButton from './CopyBranchButton'
@@ -4919,7 +4919,7 @@ function ChatInput({
           // this the chip is silently invisible whenever no other pill happens
           // to be present — the control is declared, mounted and unreachable.
           !!sessionControls?.length) && (
-        <div ref={shelfRef} className="pt-1 flex items-center gap-2 min-w-0">
+        <div ref={shelfRef} data-testid="composer-context-shelf" className="pt-1 flex items-center gap-2 min-w-0">
           {/* App-contributed session controls live in their OWN group, not
               beside the agent/project chips. `max-two-buttons-per-row`
               (AUTOSDE.yaml, blocking) caps a horizontal group at 2 action
@@ -5215,13 +5215,15 @@ function ChatInput({
             <div className="ml-1 pl-1 border-l border-border flex items-center shrink-0">
               <Btn
                 type="button"
-                className="inline-flex items-center h-7 px-2 text-[12px] text-muted hover:text-text rounded-md border-none bg-transparent"
+                className={`inline-flex items-center h-7 text-[12px] text-muted hover:text-text rounded-md border-none bg-transparent ${shelfCompact ? 'w-7 justify-center p-0' : 'gap-1.5 px-2'}`}
                 aria-label={i18nT('components.reasoningEffortDropdown.reasoning_effort')}
-                title={i18nT('components.reasoningEffortDropdown.reasoning_effort')}
+                title={`${i18nT('components.reasoningEffortDropdown.reasoning_effort')}: ${effortLabel(reasoningEffort || '')}`}
                 disabled={isRunning}
                 onClick={e => onReasoningEffortClick(e.currentTarget.getBoundingClientRect())}
+                data-testid="composer-effort-chip"
               >
-                {effortLabel(reasoningEffort || '')}
+                <BrainCircuit size={13} className="shrink-0 opacity-70" aria-hidden="true" />
+                {!shelfCompact && <span>{effortLabel(reasoningEffort || '')}</span>}
               </Btn>
             </div>
           )}

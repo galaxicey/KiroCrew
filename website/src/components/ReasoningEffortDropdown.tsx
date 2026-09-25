@@ -101,14 +101,20 @@ export default function ReasoningEffortDropdown({ slot, currentEffort, defaultEf
   // pre-pick value. performSlotSwitch serializes per slot+field and writes
   // exactly the adjudicated survivor of a burst of picks.
   const dispatch = useAppDispatch()
-  const persistEffort = useCallback((level: string) =>
-    performSlotSwitch('reasoning_effort', slot, level,
+  const persistEffort = useCallback((level: string) => {
+    let normalizedModel: string | undefined
+    return performSlotSwitch('reasoning_effort', slot, level,
       async () => {
         const r = await api.chatSlotReasoningEffort(slot, level)
+        normalizedModel = r?.model
         return r?.reasoning_effort ?? level
       },
-      (value) => dispatch(updateSlot({ key: slot, reasoning_effort: value }))),
-  [slot, dispatch])
+      (value) => dispatch(updateSlot({
+        key: slot,
+        reasoning_effort: value,
+        ...(normalizedModel ? { model: normalizedModel } : {}),
+      })))
+  }, [slot, dispatch])
 
   const announcePersistFailure = useCallback((error: unknown, failedLevel: string) => {
     // A superseded request may still reject after a newer pick was staged or

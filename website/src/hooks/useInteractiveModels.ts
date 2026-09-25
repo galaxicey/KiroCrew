@@ -16,8 +16,23 @@ export function modelEffortSuffix(name: string): string {
   return EFFORT_SUFFIX.exec(name)?.[2] || ''
 }
 
-export function shouldSeparateCodexEffort(backend: string | undefined, models: readonly ModelInfo[]): boolean {
-  return backend === 'codex' && models.some(model => !!modelEffortSuffix(model.name))
+/** Migrate an old Codex pair pin only when no separate slot effort exists. */
+export function legacyCodexEffort(model: string, slotEffort: string, pairIds: boolean): string {
+  return pairIds && !slotEffort ? modelEffortSuffix(model) : ''
+}
+
+/** A grouped model pick must not outrun migration of its old pair level. */
+export async function switchGroupedModel(
+  legacyEffort: string,
+  persistEffort: (level: string) => Promise<void>,
+  persistModel: () => Promise<void>,
+): Promise<void> {
+  if (legacyEffort) await persistEffort(legacyEffort)
+  await persistModel()
+}
+
+export function shouldSeparateModelEffort(pairIds: boolean | undefined, models: readonly ModelInfo[]): boolean {
+  return pairIds === true && models.some(model => !!modelEffortSuffix(model.name))
 }
 
 export function normalizeHiddenModels(value: unknown): string[] {
@@ -46,13 +61,15 @@ export function filterInteractiveModels(
   if (!separateEffort) return visible
 
   const seen = new Set<string>()
+  const baseModels = new Map(visible.filter(model => modelWithoutEffort(model.name) === model.name).map(model => [model.name, model]))
   return visible.flatMap(model => {
     const name = modelWithoutEffort(model.name)
     if (seen.has(name)) return []
     seen.add(name)
-    // Pair descriptions and prices describe a particular effort level. They
-    // would misstate the base model once effort has its own selector.
-    return [{ ...model, name, ...(name !== model.name ? { description: '', rateMultiplier: undefined } : {}) }]
+    // Prefer metadata from an explicitly advertised base model. Pair metadata
+    // describes one effort level, so omit it when no base row exists.
+    const base = baseModels.get(name)
+    return [{ ...(base ?? model), name, ...(!base && name !== model.name ? { description: '', rateMultiplier: undefined } : {}) }]
   })
 }
 
