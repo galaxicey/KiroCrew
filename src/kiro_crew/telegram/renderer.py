@@ -62,7 +62,11 @@ from kiro_crew.messaging.renderer import (
     session_provenance_tag,
     split_options_trailer,
 )
-from kiro_crew.messaging.split import split_markdown_safe
+from kiro_crew.messaging.split import (
+    bounded_for_delivery,
+    repaired_for_delivery,
+    split_markdown_safe,
+)
 from kiro_crew.messaging.transport import TransportCapabilities
 from kiro_crew.sel import sel
 from kiro_crew.telegram.client import (
@@ -396,8 +400,17 @@ def _split_markdown(text: str, limit: int) -> list[str]:
     cut-preference ladder (paragraph break past half the budget, else line break
     past a quarter, else a hard cut) is the same one this channel used, so chunk
     boundaries are unchanged for text with no fence in it.
+
+    The cut is credential-aware, because this channel rotates: each chunk but the
+    last is sealed as its OWN message and the redaction runs per segment, so a key
+    severed by a boundary is a key neither message holds and neither redacts,
+    while the reader scrolling the two reads it whole. Passing the redactor grades
+    the boundaries as the reader sees them and moves the cut instead, which keeps
+    every character. Nothing here asks for the prefix-stable mode: a rotation
+    replaces the buffer with the retained tail, so text already sealed is never
+    part of a later cut.
     """
-    return split_markdown_safe(text, limit)
+    return split_markdown_safe(text, limit, redactor=_default_redactor)
 
 
 # Telegram renders a small HTML subset (<b>/<i>/<code>/<pre>/<a>) far more
@@ -733,15 +746,24 @@ def _split_markdown_bounded(text: str, rendered_limit: int) -> list[str]:
     the client backstop then truncates them, silently dropping content. Only at
     the floor -- where the content is genuinely indivisible -- may oversize chunks
     be returned.
+
+    Each candidate answer also goes through
+    :func:`~kiro_crew.messaging.split.bounded_for_delivery`, because a
+    credential-aware cut may DECLINE to cut: when no budget has clean boundaries
+    the splitter answers with the text whole, which is fail-closed but is one
+    chunk over the budget, and this channel's client truncates a larger payload
+    after every scan has run. The bound cuts that answer back and grades the
+    sequence it actually produced.
     """
     src_limit = max(_MIN_SPLIT_LIMIT, rendered_limit)
-    chunks = _split_markdown(text, src_limit)
     while True:
+        chunks = bounded_for_delivery(
+            _split_markdown(text, src_limit), src_limit, _default_redactor
+        )
         worst = max((_rendered_len(c) for c in chunks), default=0)
         if worst <= rendered_limit or src_limit <= _MIN_SPLIT_LIMIT:
             return chunks
         src_limit = _shrunk_limit(src_limit, rendered_limit, worst)
-        chunks = _split_markdown(text, src_limit)
 
 
 def _split_table_rows(rows: list[str], limit: int) -> list[str]:
@@ -788,6 +810,13 @@ def _split_markdown_table_aware(text: str, rendered_limit: int, rich_limit: int)
     where a fence begins and ends means reimplementing CommonMark's fence rules
     as a second parser (the same invariant ``_seal_table_fallback`` documents),
     and a pipe pattern inside a fence is not a table anyway.
+
+    The assembled sequence is graded once at the end. Each block is cut on its own
+    here, so a boundary BETWEEN two blocks -- a table run and the prose after it,
+    or two row-split pieces -- belongs to no single cut and is graded by none of
+    them, while the reader still reads those messages in order. A repair costs the
+    table its framing, which is why it is reached only when a boundary really does
+    hand the reader a key.
     """
     if _FENCE_LINE_RE.search(text):
         return _split_markdown_bounded(text, rendered_limit)
@@ -801,7 +830,11 @@ def _split_markdown_table_aware(text: str, rendered_limit: int, rich_limit: int)
                 out.extend(_split_table_rows(lines, rich_limit))
         elif block.strip():
             out.extend(_split_markdown_bounded(block, rendered_limit))
-    return [c for c in out if c.strip()]
+    kept = [c for c in out if c.strip()]
+    repaired = repaired_for_delivery(kept, _default_redactor)
+    if repaired is None:
+        return kept
+    return _split_markdown_bounded(repaired, rendered_limit)
 
 
 def _strip_md(text: str) -> str:
@@ -1380,7 +1413,9 @@ class TelegramRenderer(Renderer):
                 if spans[0][0] == 0:
                     return  # the whole buffer is protected — do not rotate at all
                 held = raw[spans[0][0] :]
-                for chunk in _split_markdown_bounded(raw[: spans[0][0]], rendered_cap):
+                for chunk in await asyncio.to_thread(
+                    _split_markdown_bounded, raw[: spans[0][0]], rendered_cap
+                ):
                     self._buf = [chunk]
                     await self._seal_current(extract_uploads=False)
                     self._open_new_message()
@@ -1406,7 +1441,9 @@ class TelegramRenderer(Renderer):
             # _has_table guarantees at least two lines, so a newline exists.
             head, nl, partial = raw.rpartition("\n")
             head += nl
-            chunks = _split_markdown_table_aware(head, rendered_cap, rich_cap)
+            chunks = await asyncio.to_thread(
+                _split_markdown_table_aware, head, rendered_cap, rich_cap
+            )
             if chunks:
                 # Reattach what the line-joining splitter drops: the complete
                 # prefix's trailing newlines, then the unterminated line. The
@@ -1416,7 +1453,7 @@ class TelegramRenderer(Renderer):
             else:
                 chunks = [partial]
         else:
-            chunks = _split_markdown_bounded(raw, rendered_cap)
+            chunks = await asyncio.to_thread(_split_markdown_bounded, raw, rendered_cap)
         # Mid-stream the source fence is often still OPEN (the model has not
         # emitted its closing ``` yet). _split_markdown balances each chunk by
         # appending a synthetic closer, which is right for the chunks we seal but
@@ -1568,7 +1605,7 @@ class TelegramRenderer(Renderer):
         if len(html_text) > self._rendered_limit():
             html_text = _md_to_telegram_html(text)
             if len(html_text) > self._rendered_limit():
-                chunks = self._degraded_table_chunks(text)
+                chunks = await asyncio.to_thread(self._degraded_table_chunks, text)
                 for ch in chunks[:-1]:
                     await self._seal_chunk_html(ch)
                 if chunks:
