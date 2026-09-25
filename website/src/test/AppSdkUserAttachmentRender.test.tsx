@@ -56,12 +56,16 @@ describe('app-sdk user row — attachments render like ChatPage', () => {
     render(<ChatMessageList messages={[user('summarize this', { files: ['/tmp/report.pdf'] })]} running={false} />)
     const card = screen.getByTitle(/\/tmp\/report\.pdf/)
     expect(card.textContent).toContain('report.pdf')
-    // No host handler: the card must not LOOK clickable (no button role, no
-    // open-file label), the same degrade DirChip makes -- and its tooltip says
-    // WHERE the file opens, since a click here answers nothing.
-    expect(card.getAttribute('role')).toBeNull()
+    // No host handler: the card must not LOOK clickable (no interactive role,
+    // no open-file label), the same degrade DirChip makes -- and its tooltip
+    // says WHERE the file opens, since a click here answers nothing. `group` is
+    // a naming role, not an interactive one: it carries the tooltip's sentence
+    // as the card's accessible name, because a tooltip reaches a pointer only.
+    expect(card.getAttribute('role')).toBe('group')
+    expect(card.getAttribute('aria-label')).toMatch(/can't be opened here/)
     expect(card.getAttribute('title')).toMatch(/can't be opened here/)
     expect(screen.queryByRole('button', { name: /report\.pdf/ })).toBeNull()
+    expect(screen.queryByRole('link', { name: /report\.pdf/ })).toBeNull()
   })
 
   it('opens the attachment through the host handler when one is supplied', () => {

@@ -385,7 +385,11 @@ function DirChip({ label, fullPath, onOpen }: { label: string; fullPath: string;
   )
   if (!onOpen) {
     return (
-      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5 rounded border border-accent/25 bg-accent/10 text-accent text-[12px] font-mono" title={fullPath}>
+      // `title` reaches a pointer only, and the visible text is just the short
+      // label, so the accessible name carries the full path — the same
+      // role+aria-label naming FileHeaderBreadcrumb uses. The path IS runtime
+      // data, so no localized string is involved.
+      <span role="group" aria-label={fullPath} className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5 rounded border border-accent/25 bg-accent/10 text-accent text-[12px] font-mono" title={fullPath}>
         {body}
       </span>
     )
@@ -471,7 +475,9 @@ function renderInlineSegment(content: string, meta: Record<string, unknown> | un
 function FileMentionChip({ label, fullPath, onOpen }: { label: string; fullPath: string; onOpen?: (path: string) => void }) {
   const base = 'inline-flex items-center px-1.5 py-0.5 mx-0.5 rounded bg-accent/15 text-accent text-[12px] font-mono'
   if (!onOpen) {
-    return <span className={base} title={fullPath}>@{label}</span>
+    // Same reason as DirChip's inert branch: `title` is pointer-only, so the
+    // full path also becomes this chip's accessible name.
+    return <span role="group" aria-label={fullPath} className={base} title={fullPath}>@{label}</span>
   }
   return (
     <Clickable className={`${base} cursor-pointer hover:bg-accent/25 transition-colors`} title={fullPath} onClick={() => onOpen(fullPath)} aria-label={i18nT('pages.chatPage.open_file', { path: fullPath })}>@{label}</Clickable>
@@ -494,7 +500,10 @@ function FileAttachmentCard({ fullPath, label, onFileOpen }: { fullPath: string;
   if (!onFileOpen) {
     // The tooltip says WHERE the file opens, because the card looks exactly
     // like the main chat's clickable one and a click here answers nothing.
-    return <span className={base} title={i18nT('pages.chatPage.attached_file_inert', { path: fullPath })}>{body}</span>
+    // The same sentence is the accessible name: `title` opens on pointer hover
+    // only, and the card's visible text is the short label alone.
+    const inert = i18nT('pages.chatPage.attached_file_inert', { path: fullPath })
+    return <span role="group" aria-label={inert} className={base} title={inert}>{body}</span>
   }
   return (
     <Clickable
