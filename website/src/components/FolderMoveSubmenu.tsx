@@ -72,7 +72,7 @@ export function FolderPickerItems({ folders, onPick, currentFolderId, rootLabel 
               name is aria-hidden, so the item is spoken as its path once rather
               than as the leaf name followed by a path ending in that same name. */}
           <span className="truncate" aria-hidden={path !== f.name || undefined}>{f.name}</span>
-          {path !== f.name && <span className="sr-only">{path}</span>}
+          {path !== f.name && <span className="sr-only select-none">{path}</span>}
           {currentFolderId === f.id && <Check size={13} className="ml-auto text-accent shrink-0" />}
         </Item>
       ))}

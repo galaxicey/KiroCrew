@@ -395,9 +395,12 @@ function DirChip({ label, fullPath, onOpen }: { label: string; fullPath: string;
       // stop per chip. FileHeaderBreadcrumb names a FOCUSABLE region instead.
       // The visible label is aria-hidden so the path is spoken ONCE and whole,
       // rather than the basename twice; the path already contains it.
+      // `select-none` keeps the hidden path out of a copied selection: `sr-only`
+      // hides text visually but leaves it in the DOM, so selecting the bubble
+      // would otherwise paste the path alongside the label a reader sees.
       <span className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5 rounded border border-accent/25 bg-accent/10 text-accent text-[12px] font-mono" title={fullPath}>
         <span aria-hidden="true" className="inline-flex items-center gap-1">{body}</span>
-        <span className="sr-only">{fullPath}</span>
+        <span className="sr-only select-none">{fullPath}</span>
       </span>
     )
   }
@@ -485,7 +488,7 @@ function FileMentionChip({ label, fullPath, onOpen }: { label: string; fullPath:
     // Same reason as DirChip's inert branch: `title` is pointer-only, so the
     // full path rides along as visually-hidden text, and the visible label is
     // aria-hidden so the basename is not spoken twice.
-    return <span className={base} title={fullPath}><span aria-hidden="true">@{label}</span><span className="sr-only">{fullPath}</span></span>
+    return <span className={base} title={fullPath}><span aria-hidden="true">@{label}</span><span className="sr-only select-none">{fullPath}</span></span>
   }
   return (
     <Clickable className={`${base} cursor-pointer hover:bg-accent/25 transition-colors`} title={fullPath} onClick={() => onOpen(fullPath)} aria-label={i18nT('pages.chatPage.open_file', { path: fullPath })}>@{label}</Clickable>
@@ -516,7 +519,7 @@ function FileAttachmentCard({ fullPath, label, onFileOpen }: { fullPath: string;
     return (
       <span className={base} title={inert}>
         <span aria-hidden="true" className="flex items-center gap-2.5 min-w-0">{body}</span>
-        <span className="sr-only">{inert}</span>
+        <span className="sr-only select-none">{inert}</span>
       </span>
     )
   }

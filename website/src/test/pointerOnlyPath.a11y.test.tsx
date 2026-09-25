@@ -110,6 +110,22 @@ describe('inert sent-message chips read out the full path, not only the tooltip'
     expect(sentence).toContain(pdf)
   })
 
+  it('keeps the hidden path out of a copied selection', () => {
+    // `sr-only` hides text visually but leaves it in the DOM, so selecting a
+    // bubble and copying it would paste the path alongside the label a reader
+    // sees. Every hidden span is `select-none` for that reason -- the same
+    // aria-hidden + select-none pairing RepoSwitcher uses for its sentinels.
+    const dir = '/repo/main/website/src'
+    const pdf = '/home/u/q3/report.pdf'
+    const { container } = inert(
+      'look in [attached_dir 1] /repo/main/website/src and [attached_file 1] /home/u/q3/report.pdf',
+      { dirs: [dir], files: [pdf] },
+    )
+    const hidden = [...container.querySelectorAll('.sr-only')]
+    expect(hidden.length).toBeGreaterThan(0)
+    for (const el of hidden) expect(el.className).toContain('select-none')
+  })
+
   it('keeps the inert chip inert: a naming role is not added in place of an action', () => {
     // The degrade contract is that an inert chip must not LOOK actionable. The
     // path is text, so it needs no role at all.
@@ -160,6 +176,11 @@ describe('folder-move menu items read out their nesting path', () => {
     const top = screen.getByRole('menuitem', { name: 'Notes' })
     expect(srText(top)).toBe('')
     expect(mutedText(top)).toBe('')
+
+    // Hidden text stays out of a copied selection, same as the chips.
+    for (const el of document.querySelectorAll('.sr-only')) {
+      expect(el.className).toContain('select-none')
+    }
   })
 })
 
