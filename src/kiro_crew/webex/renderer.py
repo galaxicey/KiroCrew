@@ -34,6 +34,7 @@ Dependency direction is ``webex -> messaging`` (allowed).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -393,7 +394,15 @@ class WebexRenderer(Renderer):
         # budget) that a hand-rolled copy of this loop spins forever on. And
         # deliberately the FENCE-BLIND one, not ``split_markdown_bytes``: the
         # answer path above re-seals its own fences.
-        chunks = chunk_utf8_bytes(content, WEBEX_MAX_TEXT, redactor=_redact_all) or ["…"]
+        # OFFLOADED, like every other site that hands this splitter a redactor:
+        # the grade redacts and rescans the text once per candidate boundary and
+        # the search tries many budgets, so a final answer where no cut is clean
+        # holds the thread for seconds. This gateway runs every channel, every turn
+        # and the liveness heartbeat on one loop, and the watchdog exits the
+        # process when that loop goes quiet.
+        chunks = await asyncio.to_thread(
+            chunk_utf8_bytes, content, WEBEX_MAX_TEXT, redactor=_redact_all
+        ) or ["…"]
         first, rest = chunks[0], chunks[1:]
         delivered = False
         if self._placeholder_id is not None:
