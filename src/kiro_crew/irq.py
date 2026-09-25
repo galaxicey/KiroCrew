@@ -1083,10 +1083,16 @@ class _DriverCtx:
     ``getattr`` with a default, and :func:`run` types its parameter as a bare
     ``object``. So the kernel was never cron-specific; this makes that a named,
     tested entry point instead of a property a caller has to rediscover.
+
+    ``in_process`` is how a probe tells this driver from a script cron's context.
+    A probe whose script driver is retired refuses the script path and keeps
+    serving this one, and a marker set here says which is which without the probe
+    testing for a private type.
     """
 
     job: _DriverJob
     message: str
+    in_process: bool = True
 
 
 def poll(
