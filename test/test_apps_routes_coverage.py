@@ -2075,6 +2075,57 @@ class TestDisableBranches:
             assert (await resp.json())["error"] == "metadata locked"
 
 
+class TestRepeatedToggleIsIdempotent:
+    """#11057: a second enable/disable must not re-run side effects."""
+
+    @pytest.mark.asyncio
+    async def test_repeated_enable_runs_side_effects_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        calls: list[str] = []
+
+        async def _hooks(*args: Any, **kwargs: Any) -> None:
+            calls.append("hooks")
+
+        monkeypatch.setattr(routes_mod, "on_app_enable", _hooks)
+        monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: calls.append("backend"))
+        async with TestClient(TestServer(_make_app())) as client:
+            first = await client.post(f"/api/apps/{APP}/enable")
+            assert first.status == 200
+            assert calls == ["backend", "hooks"]
+            second = await client.post(f"/api/apps/{APP}/enable")
+            assert second.status == 200
+            assert (await second.json())["message"] == f"{APP} is already enabled"
+        assert calls == ["backend", "hooks"]
+
+    @pytest.mark.asyncio
+    async def test_repeated_disable_runs_teardown_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        enable_app(APP)
+        real_teardown = routes_mod.teardown_app_runtime
+        calls: list[str] = []
+
+        async def _teardown(*args: Any, **kwargs: Any) -> Any:
+            calls.append("teardown")
+            return await real_teardown(*args, **kwargs)
+
+        monkeypatch.setattr(routes_mod, "teardown_app_runtime", _teardown)
+        monkeypatch.setattr(routes_mod, "stop_app_backend", lambda n: None)
+        async with TestClient(TestServer(_make_app())) as client:
+            first = await client.post(f"/api/apps/{APP}/disable")
+            assert first.status == 200
+            assert calls == ["teardown"]
+            second = await client.post(f"/api/apps/{APP}/disable")
+            assert second.status == 200
+            assert (await second.json())["message"] == f"{APP} is already disabled"
+        assert calls == ["teardown"]
+
+
 # ---------------------------------------------------------------------------
 # _client_install_manifest
 # ---------------------------------------------------------------------------

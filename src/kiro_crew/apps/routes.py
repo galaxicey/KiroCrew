@@ -1891,6 +1891,7 @@ async def handle_enable_app(request: web.Request) -> web.Response:
     # install/update/uninstall of the same app (e.g. enabling while an
     # off-loop uninstall is deleting the app directory).
     async with app_lifecycle_lock(name):
+        was_enabled = is_app_enabled(name)
         result = enable_app(name, session_approval_consent=session_approval_consent)
         if not result.ok:
             sel().log_api_access(
@@ -1901,6 +1902,9 @@ async def handle_enable_app(request: web.Request) -> web.Response:
                 error=result.error,
             )
             return web.json_response(result.to_dict(), status=400)
+        if was_enabled:
+            # Already enabled: skip registration, backend, deps and hooks (#11057).
+            return web.json_response(result.to_dict())
 
         resp: dict[str, Any] = result.to_dict()
 
@@ -2101,6 +2105,10 @@ async def handle_disable_app(request: web.Request) -> web.Response:
         startup_refusal = await _refuse_while_startup_hook_runs(name, action="disable")
         if startup_refusal is not None:
             return startup_refusal
+        if not is_app_enabled(name):
+            # Already disabled: skip teardown so its hooks do not re-run (#11057).
+            result = disable_app(name)
+            return web.json_response(result.to_dict(), status=200 if result.ok else 400)
 
         # `onDisable` is NOT run here: it runs inside `teardown_app_runtime`
         # below, so that revoking an app's execution grant runs it too. Keeping it
