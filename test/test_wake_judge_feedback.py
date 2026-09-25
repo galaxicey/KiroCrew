@@ -1920,6 +1920,16 @@ class TestProbeFloorFiresAJudgedTick:
         )
         service = AutoNudgeService(base_dir=tmp_path)
         service._loops[loop.id] = loop
+        persisted: list[str] = []
+        real_persist = service._persist_judge_state
+
+        async def _recording_persist(target_loop: NudgeLoop) -> bool:
+            persisted.append("start")
+            landed = await real_persist(target_loop)
+            persisted.append("done")
+            return landed
+
+        service._persist_judge_state = _recording_persist  # type: ignore[method-assign]
 
         async def _judge_suppresses(target_loop: NudgeLoop) -> bool:
             """What the judge leaves behind when it answers quiet below its own floor."""
@@ -1940,6 +1950,10 @@ class TestProbeFloorFiresAJudgedTick:
             # Only the floor branch owes this charge, so it is what proves the tick
             # reached the floor rather than returning early on a fallback.
             assert loop.id in service._pending_floor_tick, "the floor branch ran"
+            # The withdrawal is a memory edit, so the tick has to await its durable
+            # write: a deferred one that never lands leaves a restart reading the row
+            # as suppressed and the next delivery writing the false label back.
+            assert persisted == ["start", "done"], "the withdrawal landed before the fire"
             # The fire lands, so the corrected row is stamped like any other delivery
             # and the turn it delivered is what labels it.
             service._confirm_judge_delivery(loop)
@@ -1998,6 +2012,14 @@ class TestProbeFloorFiresAJudgedTick:
         loop.judge_recent_verdicts = [_suppressed(1.0, "v-old")]
         service = AutoNudgeService(base_dir=tmp_path)
         service._loops[loop.id] = loop
+        persisted: list[str] = []
+        real_persist = service._persist_judge_state
+
+        async def _recording_persist(target_loop: NudgeLoop) -> bool:
+            persisted.append("start")
+            return await real_persist(target_loop)
+
+        service._persist_judge_state = _recording_persist  # type: ignore[method-assign]
 
         async def _no_lane_armed(_target_loop: NudgeLoop) -> None:
             return None
@@ -2007,6 +2029,9 @@ class TestProbeFloorFiresAJudgedTick:
         async def drive() -> None:
             assert await service._monitor_tick_is_quiet(loop) is False, "the floor must fire"
             assert loop.id in service._pending_floor_tick, "the floor branch ran"
+            # No row of this tick's to make durable, so the streak reset rides the
+            # deferred write exactly as it does without a judge.
+            assert persisted == [], "no judge write is forced on a tick that asked nothing"
             service._confirm_judge_delivery(loop)
             history, _ = judge.label_latest_delivery(loop.judge_recent_verdicts, acted=True)
             loop.judge_recent_verdicts = history
