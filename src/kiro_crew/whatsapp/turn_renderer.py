@@ -48,8 +48,10 @@ from kiro_crew.messaging.approval import (
     build_approval_prompt,
     open_approval,
 )
+from kiro_crew.messaging.display_safety import joins_to_a_credential
 from kiro_crew.messaging.outbound_files import Rejection, hide_local_refs
 from kiro_crew.messaging.renderer import Renderer, count_redaction_tags, redaction_notice
+from kiro_crew.messaging.split import repaired_for_delivery, split_markdown_safe
 from kiro_crew.messaging.transport import TransportCapabilities
 from kiro_crew.whatsapp import client as wa_client
 from kiro_crew.whatsapp.files import (
@@ -58,7 +60,11 @@ from kiro_crew.whatsapp.files import (
     rejection_note,
 )
 from kiro_crew.whatsapp.group_gate import SILENCE_SENTINEL
-from kiro_crew.whatsapp.renderer import display_safe_text, render_chunks_off_loop
+from kiro_crew.whatsapp.renderer import (
+    _redact_all,
+    display_safe_text,
+    render_chunks_off_loop,
+)
 
 if TYPE_CHECKING:
     from kiro_crew.whatsapp.client import WhatsAppClient
@@ -231,9 +237,17 @@ class WhatsAppRenderer(Renderer):
         if not chunks or self._sealed_count >= len(chunks):
             return
         # Every chunk before the last is final: the splitter is prefix-stable, so
-        # later text can never revise one.
+        # later text can never revise one. What it cannot promise is that the
+        # BOUNDARY is safe, so each one is graded against everything that follows
+        # before the chunk is counted final -- a key whose halves land either side
+        # reads whole down the screen, and a sealed message cannot be taken back.
+        # A chunk that does not pass stays in the live bubble, where a later frame
+        # may still revise it.
         while self._sealed_count < len(chunks) - 1:
-            await self._seal_chunk(chunks[self._sealed_count])
+            index = self._sealed_count
+            if joins_to_a_credential(chunks[index], "".join(chunks[index + 1 :]), _redact_all):
+                return
+            await self._seal_chunk(chunks[index])
         tail = chunks[-1]
         if not self._live_id and len(tail) < _MIN_FIRST_FLUSH_CHARS and not self._sealed_count:
             return  # too early to be worth a bubble
@@ -271,7 +285,7 @@ class WhatsAppRenderer(Renderer):
         body = await asyncio.to_thread(hide_local_refs, visible)
         if not body:
             return []
-        return await render_chunks_off_loop(body, self.capabilities.max_message_chars)
+        return await render_chunks_off_loop(body, self.capabilities.max_message_chars, stable=True)
 
     def _edit_window_closed(self) -> bool:
         if not self._live_sent_at:
@@ -511,6 +525,17 @@ class WhatsAppRenderer(Renderer):
         if self._undelivered_from is not None:
             start = min(start, self._undelivered_from)
         pending = chunks[start:]
+        # The seal loop refuses a chunk whose boundary is not clean, so a reply can
+        # arrive here with that boundary still pending. This is the last pass and
+        # every chunk must go, so the tail is repaired instead of held: these
+        # chunks are unsealed, which is exactly what makes changing them allowed.
+        repaired = repaired_for_delivery(pending, _redact_all)
+        if repaired is not None:
+            # Already dialect-converted, so it is cut directly rather than sent
+            # back through the renderer, which would convert it a second time.
+            pending = await asyncio.to_thread(
+                split_markdown_safe, repaired, self.capabilities.max_message_chars
+            ) or [repaired]
         for index, chunk in enumerate(pending):
             is_last = index == len(pending) - 1
             # This is the last pass over the text, so there is no later flush to

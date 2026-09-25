@@ -57,7 +57,7 @@ from kiro_crew.messaging.renderer import (
     count_redaction_tags,
     redaction_notice,
 )
-from kiro_crew.messaging.split import split_markdown_safe
+from kiro_crew.messaging.split import repaired_for_delivery, split_markdown_safe
 from kiro_crew.messaging.transport import TransportCapabilities
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -868,17 +868,28 @@ class SlackRenderer(Renderer):
         drops the synthetic closer with the content and leaves an unterminated
         code block. Blind slicing costs a boundary Markdown may render badly and
         keeps every authored character.
+
+        That slice lands AFTER the splitter graded its own boundaries, and each
+        piece is posted as its own message, so the sequence is graded once more at
+        the end: a credential the scaffolding pushed across a slice would
+        otherwise be whole on screen. The repair is safe to bound again, which is
+        why one grade at the end is enough.
         """
         limit = self._limit()
         if len(text) + reserve <= limit:
             return [text]
-        chunks = await asyncio.to_thread(
-            split_markdown_safe, text, limit, reserve=reserve, redactor=_redact_all
-        )
-        bounded: list[str] = []
-        for chunk in chunks:
-            bounded.extend(chunk_text(chunk, SLACK_MSG_LIMIT - reserve) or [chunk])
-        return bounded or [text]
+
+        def _bounded() -> list[str]:
+            chunks = split_markdown_safe(text, limit, reserve=reserve, redactor=_redact_all)
+            out: list[str] = []
+            for chunk in chunks:
+                out.extend(chunk_text(chunk, SLACK_MSG_LIMIT - reserve) or [chunk])
+            repaired = repaired_for_delivery(out, _redact_all)
+            if repaired is None:
+                return out
+            return chunk_text(repaired, SLACK_MSG_LIMIT - reserve) or [repaired]
+
+        return await asyncio.to_thread(_bounded) or [text]
 
     async def _render_fallback(self, text: str) -> None:
         """Final no-stream render: the whole answer, not a truncated prefix.
