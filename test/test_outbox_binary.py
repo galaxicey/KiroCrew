@@ -814,16 +814,100 @@ class TestContainerSymbolTablesAreNotCredentials:
         ]
         assert any(security.redact(slice_) != slice_ for slice_ in at_floor)
 
-    def test_the_filler_is_whitespace(self):
-        """What makes blanking unable to extend a value run into a fresh match.
+    def test_the_filler_is_admitted_by_every_boundary_crossing_class(self):
+        """What stops blanking from destroying a match that crossed the region.
 
-        Every credential value class carrying no literal label excludes
-        whitespace, so the filler's one required property is that it is
-        whitespace.
+        A credential's match can anchor ACROSS a masked region, because the
+        non-text bytes delimiting the region sit inside the value classes that
+        carry no literal label. A filler those classes reject terminates the run
+        and the match vanishes from the scanned copy, so the filler must be one
+        they all accept.
         """
+        import re
+
         from kiro_crew.security.redaction import _MASKED_TABLE_FILLER
 
-        assert _MASKED_TABLE_FILLER.isspace()
+        crossing = {
+            "url password": r"[^\s/]",
+            "key-value value": r"[^\s\"',}]",
+            "url userinfo": r"[^\s:/@]",
+            "pem body span": r"[\s\S]",
+        }
+        rejected = [
+            name
+            for name, pattern in crossing.items()
+            if not re.fullmatch(pattern, _MASKED_TABLE_FILLER)
+        ]
+        assert rejected == [], rejected
+
+    def test_the_filler_is_admitted_by_no_contiguous_token_class(self):
+        """What stops blanking from building a match the raw bytes lacked.
+
+        The same filler must not be able to LENGTHEN a contiguous token run, and
+        it is what cancels the table's own bot-token shape for the same reason.
+        """
+        import re
+
+        from kiro_crew.security.redaction import _MASKED_TABLE_FILLER
+
+        contiguous = {
+            "bare secret run": r"[A-Za-z0-9+/]",
+            "token body": r"[A-Za-z0-9_-]",
+            "numeric id": r"[0-9]",
+            "base64 pem body": r"[A-Za-z0-9+/=]",
+        }
+        admitted = [
+            name
+            for name, pattern in contiguous.items()
+            if re.fullmatch(pattern, _MASKED_TABLE_FILLER)
+        ]
+        assert admitted == [], admitted
+
+    def test_a_credential_anchored_across_the_table_survives_masking(self):
+        """A match spanning the masked region must still be there afterwards.
+
+        The URL userinfo class admits the non-text bytes that delimit a region, so
+        a password can begin before the table and reach its ``@`` after it. The
+        table is still its own maximal region and is still masked, so the only
+        thing standing between this and a delivered password is the filler not
+        terminating the run.
+        """
+        from kiro_crew.platform import binary_content_is_flagged
+        from kiro_crew.security import redact
+        from kiro_crew.security.redaction import (
+            _BASELINE_SYMBOL_TABLE,
+            mask_baseline_symbol_tables,
+        )
+
+        password = "hunter2hunter2hunter2"
+        raw = (
+            b"\xff\xd8\xff\xe0"
+            + f"https://x:{password}\x80".encode("latin-1")
+            + _BASELINE_SYMBOL_TABLE.encode("latin-1")
+            + b"\x80@db.example.com/"
+        )
+        text = raw.decode("latin-1")
+        # The premise: the match really does cross the region, and the password is
+        # too short for any contiguous-run detector to catch on its own.
+        assert redact(text) != text
+        assert len(password) < 40
+        masked = mask_baseline_symbol_tables(text)
+        assert masked is not text, "the table region must actually be masked"
+        assert _BASELINE_SYMBOL_TABLE not in masked
+        assert redact(masked) != masked
+        assert binary_content_is_flagged(raw)
+
+    @pytest.mark.parametrize("boundary", ["\x80", "\xff", "\x00", "\x81\x82"])
+    def test_a_crossing_credential_survives_at_every_boundary_spelling(self, boundary):
+        """Whatever non-text bytes delimit the region, the crossing match holds."""
+        from kiro_crew.platform import binary_content_is_flagged
+        from kiro_crew.security.redaction import _BASELINE_SYMBOL_TABLE
+
+        payload = (
+            f"https://user:{'p' * 30}{boundary}{_BASELINE_SYMBOL_TABLE}{boundary}"
+            "@host.example.com/"
+        )
+        assert binary_content_is_flagged(b"\xff\xd8\xff\xe0" + payload.encode("latin-1"))
 
     def test_masking_never_turns_a_clean_buffer_into_a_flagged_one(self):
         from kiro_crew.security import redact

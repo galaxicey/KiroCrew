@@ -936,12 +936,24 @@ _BASELINE_SYMBOL_TABLE_MIN = 37
 #: did before this masker existed.
 _MASKED_REGION_CAP = 4096
 
-#: Substituted for every character of a masked table. A space, and whitespace is
-#: the property that matters: every credential value class carrying no literal
-#: label excludes whitespace -- ``[^\s"',}]+``, ``[^\s/]+@``, ``[^\s:/@]*`` and
-#: ``_BARE_SECRET_RUN_RE``'s ``[A-Za-z0-9+/]`` all reject it -- so blanking can
-#: only END a value run, never extend one into a match the raw bytes did not have.
-_MASKED_TABLE_FILLER = " "
+#: Substituted for every character of a masked table. A tilde, and the property
+#: that matters is which character classes admit it -- in BOTH directions, because
+#: blanking a region can break a match as well as build one.
+#:
+#: It must be admitted by every value class that can cross the region's boundary.
+#: A credential's match can ANCHOR ACROSS a masked region: the non-text bytes that
+#: delimit the region are themselves inside ``[^\s/]+``, ``[^\s"',}]+`` and
+#: ``[^\s:/@]*``, so a URL password can begin before a table and reach its ``@``
+#: after it. A filler those classes reject -- a space, most obviously -- TERMINATES
+#: that run, and the match the raw bytes had disappears from the scanned copy.
+#: ``~`` is admitted by all three, so a crossing match survives masking intact.
+#:
+#: It must be admitted by no class that builds a contiguous token: not
+#: ``[A-Za-z0-9+/]`` (``_BARE_SECRET_RUN_RE``), ``[A-Za-z0-9_-]``, ``[0-9]`` or a
+#: PEM body. ``~`` is in none of them, so blanking can only SHORTEN such a run,
+#: never lengthen one into a match the raw bytes lacked -- which is also what
+#: cancels the table's own bot-token shape, the point of masking at all.
+_MASKED_TABLE_FILLER = "~"
 
 #: A maximal region of TEXT bytes -- the only bytes a credential can be written
 #: in. Maximality is load-bearing rather than an optimisation: a region is bounded
@@ -968,14 +980,23 @@ def mask_baseline_symbol_tables(text: str) -> str:
     character multiset, and the table's characters are all distinct, so it scores
     the full bits per character a generated secret does.
 
-    A region is masked only when it EQUALS a contiguous slice of
-    :data:`_BASELINE_SYMBOL_TABLE`, one fixed public 45-character constant. That is
-    the whole safety argument and it needs no reasoning about shapes: the only
-    characters this function can remove are characters of that constant, so it
-    cannot remove an attacker's byte, and a value is maskable only if the attacker
-    already knows it. A credential-shaped run that merely resembles a table --
-    ascending, high-diversity, delimited -- is not a slice of the constant and
-    keeps its whole match.
+    Safety rests on two bounds, and one alone is not enough. WHAT MAY BE REMOVED:
+    a region is masked only when it EQUALS a contiguous slice of
+    :data:`_BASELINE_SYMBOL_TABLE`, one fixed public 45-character constant, so the
+    only characters this function can remove are characters of that constant and a
+    value is maskable only if whoever wrote it already knows it. No reasoning about
+    shapes is involved, which is the point: a credential-shaped run that merely
+    resembles a table -- ascending, high-diversity, delimited -- is not a slice of
+    the constant and keeps its whole match.
+
+    WHAT THE REMOVAL MAY BREAK is the second bound, and it belongs to
+    :data:`_MASKED_TABLE_FILLER` rather than to the region test. A credential's
+    match can ANCHOR ACROSS a masked region, because the non-text bytes delimiting
+    the region are inside the value classes that carry no literal label, so
+    removing only PUBLIC characters can still destroy a match that spanned them.
+    The filler is chosen so it cannot: every boundary-crossing class admits it, so
+    a crossing match survives, and no contiguous-token class does, so a token run
+    can only shorten.
 
     Whole-region equality is what keeps a table from covering for a neighbour.
     Regions are maximal, so a table written next to a credential shares one region
