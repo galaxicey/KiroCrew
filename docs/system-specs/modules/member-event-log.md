@@ -273,10 +273,28 @@ when the member has never spoken, so the stale line does not stand beside an emp
 chat — and a second read appends nothing. The correction is written through
 `append_closer_if_still_applies` with `_preview_is_still_at`: the roster's
 `last_message` and `last_active_ts` must still read as they did when `api_members`
-observed them BEFORE its transcript read, re-checked under the per-slug write lock,
-so a `member/message` the crewmate speaks while the read is in flight refuses the
-older answer instead of being overwritten by it (the fold is last-wins by append
+observed them BEFORE its transcript read, re-checked while this process OWNS the
+log, so a `member/message` the crewmate speaks while the read is in flight refuses
+the older answer instead of being overwritten by it (the fold is last-wins by append
 order, so a stale append would otherwise regress both fields durably).
+
+That recheck runs inside the store's own hold, not merely under the per-slug lock.
+The per-slug lock orders this process's writers, and for them it settles the
+question: a concurrent in-process append queues behind the hold and lands after,
+which is the winning order. It says nothing about another process, and the member
+log has more than one writer, so an entry committed elsewhere between the fold and
+the write lands FIRST and a last-wins projection then reads the closer as the newer
+word for a state that had already moved. `CrewLogStore.append_if` therefore takes a
+`precondition` and calls it with the newest committed seq after write ownership and
+the per-append lock are both held and the tail has been read, writing only if it
+answers true; a decline writes nothing and leaves the file byte-identical, exactly
+as a format refusal does. `append_closer_if_still_applies` supplies a precondition
+that folds whatever that hold made visible and then asks the caller's predicate, so
+the values the predicate reads are the values the event will land on. The
+precondition runs under a cross-process lock, so it must be bounded and must not
+write to the log; reads are safe, because `iter_from`, `page` and `resolve` take
+neither the lease nor that lock, and the lease is refcounted per process so a
+nested claim from the same process is not contention.
 The correction is also gated on the read being TRUSTWORTHY: `last_speech_info`
 returns a fourth value, `exhaustive`, true only when the tail walk reached the
 start of the transcript. A patroller that has written more than the widest tail

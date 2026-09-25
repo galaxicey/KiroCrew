@@ -1105,19 +1105,44 @@ class MemberEventLogService:
         This exists rather than a predicate on :meth:`append` because the predicate
         must not re-enter the service to read state -- ``snapshot`` takes this same
         non-reentrant lock, so a caller that reached for it would deadlock.
+
+        The predicate is asked while this process OWNS the log, inside the store's
+        lease and per-append lock, not merely under the per-slug lock above. The
+        per-slug lock orders this process's own writers, and for them it is enough:
+        a concurrent in-process append queues behind this hold and lands after,
+        which is the winning order. It says nothing about another PROCESS, and the
+        member log has more than one writer -- an entry another process commits
+        between our fold and our write lands FIRST, and a last-wins projection then
+        takes ours as the newer word for a state that had already moved. Inside the
+        store's hold the file cannot move, so the values the predicate reads are the
+        values this event will land on. ``_fold_gap_locked`` there folds whatever
+        that hold made visible, which is how those values become current.
         """
         lock = self._slug_lock(slug)
         with lock:
             log = self._get_log(slug)
             if log is None:
                 return None
-            values = self._registry.snapshot(slug).get("values", {})
-            if not still_applies(
-                values if isinstance(values, dict) else {},
-                observed if isinstance(observed, dict) else {},
-            ):
+
+            def _still_applies_under_ownership(last_seq: int) -> bool:
+                # Whatever another process committed is now visible and unfolded;
+                # fold it before reading, or the values below are this process's
+                # stale view and the question is asked of the wrong state. Bounded
+                # below the seq this event would take, which is the range the
+                # append path always folds.
+                self._fold_gap_locked(slug, log, below=last_seq + 1)
+                values = self._registry.snapshot(slug).get("values", {})
+                return still_applies(
+                    values if isinstance(values, dict) else {},
+                    observed if isinstance(observed, dict) else {},
+                )
+
+            event = log.append_if(type, data, precondition=_still_applies_under_ownership)
+            if event is None:
                 return None
-            return self._append_locked(slug, log, type, data)
+            self._fold_gap_locked(slug, log, below=event["seq"])
+            self._registry.drive(slug, event)
+            return event
 
     def _fold_gap_locked(self, slug: str, log: MemberLog, *, below: int | None = None) -> None:
         """Fold events on disk that this process has not folded; caller holds the lock.
