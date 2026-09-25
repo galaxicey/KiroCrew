@@ -9090,20 +9090,135 @@ async def api_chat_slot_autocompact(request: web.Request) -> web.Response:
         )
 
 
+async def _bulk_effort_only_switch(
+    state: DashboardState,
+    slot: _ChatSlot,
+    name: str,
+    session_key: str,
+    effort: str,
+    *,
+    skip_running: bool,
+) -> str:
+    """Apply *effort* to a slot whose model already matches -- never by a reset.
+
+    The bulk switch reserves the session reset for a MODEL change (a new model
+    cannot serve the old transcript). An effort-only difference takes the
+    no-reset apply of ``api_chat_slot_reasoning_effort``: pushed live to an
+    idle effort-capable provider (``change_effort`` / ``clear_effort``, which
+    also rewrite the kiro overlay a respawn would re-read), recorded as a
+    persisted no-op on a model that cannot use effort, and recorded for the
+    next cold start when no session is live. A provider mid-turn is skipped:
+    a push would race the prompt loop, and a recorded level would not reach a
+    session that is only read at creation. The conversation is kept in every
+    case.
+
+    Returns ``"applied"`` (the caller commits the slot value), ``"skipped"``
+    (report in ``skipped_running``; nothing changed, a retry can succeed) or
+    ``"failed"`` (report in ``failed``; nothing changed). Where the single-slot
+    handler falls back to a reset -- a live push that raised or returned False,
+    a ``clear_effort()`` that returned None because another writer holds the
+    overlay lock, a live provider with no effort channel -- this returns
+    ``"failed"``: a reset here would discard a conversation the caller was
+    told an effort-only switch keeps, so the slot keeps its old effort and
+    the caller decides. ``skip_running`` keeps its meaning (a running slot is
+    skipped), but ``skip_running=False`` cannot force anything here: there is
+    no turn to tear down, so a running slot is skipped, never reset. Must run
+    inside the switch locks with *session_key* resolved there.
+    """
+    live = state.sessions.get_provider(session_key)
+    busy = _switch_target_busy(state, slot, session_key, live)
+    if busy and skip_running:
+        return "skipped"
+    if isinstance(live, AcpProvider):
+        if not live.supports_effort():
+            # Persisted no-op (the single-slot handler's): nothing live to
+            # touch, so a running turn is irrelevant; the value waits on the
+            # slot for a switch to a capable model.
+            logger.info(
+                "Bulk effort switch: slot %s effort persisted (model not effort-capable)", name
+            )
+            return "applied"
+        if live.has_active_turn():
+            # A live push now would race the streaming prompt loop on stdout,
+            # and recording the level without a push would not reach this
+            # session: a later turn reuses the live provider, which reads the
+            # slot's effort only when it is created. Reached only with
+            # skip_running=False (the busy check above skips it otherwise):
+            # there is no turn to tear down for an effort-only change, so the
+            # slot is skipped, left as it was, for a retry once the turn ends.
+            return "skipped"
+        if busy:
+            # A turn dispatched through this slot that has not reached the
+            # provider yet, or a sibling alias cold-starting on this session:
+            # the single-slot handler answers 409 here (nothing to defer on,
+            # and a push now would race the start). The bulk analogue is a
+            # skip the caller retries; nothing is committed.
+            return "skipped"
+        try:
+            pushed = await live.change_effort(effort) if effort else await live.clear_effort()
+        except Exception as exc:
+            logger.warning(
+                "Bulk effort switch: change_effort(%s) failed for slot %s: %s: %s -- "
+                "effort left unchanged (no reset on an effort-only switch)",
+                effort or "default",
+                name,
+                type(exc).__name__,
+                exc,
+            )
+            return "failed"
+        if not pushed:
+            # False: the provider could not apply it live (no effort channel,
+            # an adapter build without the option, or a clear whose default
+            # only a respawn re-resolves). None: clear_effort changed NOTHING
+            # because the workspace overlay is locked by another writer.
+            # Either way the level did not land, and the single-slot handler's
+            # remedy (a reset) is exactly what this path refuses.
+            return "failed"
+        return "applied"
+    if live is None:
+        if busy:
+            # A cold start is in flight on this slot (or a sibling alias):
+            # the factory already read the slot's CURRENT effort for it, so
+            # recording a new one now would advertise a level the session
+            # coming up does not run.
+            return "skipped"
+        # No live session: the next cold start reads the slot value as its
+        # override (ConfigLoader's ``reasoning_effort_override or default``).
+        return "applied"
+    # A live provider with no effort channel at all. The single-slot handler
+    # resets so a cold start applies the level through the factory; an
+    # effort-only bulk switch does not reset.
+    return "failed"
+
+
 async def api_chat_slots_model(request: web.Request) -> web.Response:
     """POST /api/chat/slots/model — set the model for ALL chat slots (bulk).
 
-    Body: {"model": "<name>" | "", "skip_running": bool (default True)}.
+    Body: {"model": "<name>" | "", "skip_running": bool (default True),
+    "reasoning_effort": "" | "<level>" (optional)}.
     "" selects the provider/auto default. Applies the model to every slot
-    whose model differs, resetting each affected slot's session. Mid-turn
-    policy deliberately differs from ``api_chat_slot_model``: the single-slot
-    handler prefers a live in-place switch and answers 409 for a slot
-    mid-turn, while this bulk endpoint always resets and skips mid-turn slots
-    when ``skip_running`` is true (the default) — passing ``skip_running:
-    false`` is an explicit opt-in that still tears down in-flight turns.
+    whose model differs, resetting each affected slot's session. When
+    ``reasoning_effort`` is present it is applied alongside the model, and ""
+    clears the slot's override so it runs at the configured default. Absent
+    or null leaves every slot's effort as it is. The reset is reserved for a
+    MODEL change: a slot whose model already matches but whose effort differs
+    takes the same no-reset apply as the single-slot effort pick (see
+    ``_bulk_effort_only_switch`` -- live push, skipped mid-turn, persisted
+    no-op on a non-capable model, recorded for the next cold start), so its
+    conversation is kept. The level is recorded on the slot whether or not
+    the target model can use it, exactly as the single-slot effort pick
+    records it on a non-capable model. Mid-turn policy deliberately differs
+    from ``api_chat_slot_model``: the single-slot handler prefers a live
+    in-place switch and answers 409 for a slot mid-turn, while this bulk
+    endpoint always resets a model change and skips mid-turn slots when
+    ``skip_running`` is true (the default) — passing ``skip_running: false``
+    is an explicit opt-in that still tears down in-flight turns for a model
+    change (an effort-only slot is never torn down: it is skipped).
     Returns the slot keys that were switched / skipped / unchanged /
-    failed; a per-slot reset failure is isolated (that slot is reported in
-    ``failed`` and keeps its old model) rather than aborting the whole switch.
+    failed; a per-slot failure is isolated (that slot is reported in
+    ``failed`` and keeps its old model and effort) rather than aborting the
+    whole switch -- a reset that raised, or an effort-only live push that
+    did not land.
     """
     state: DashboardState = request.app["state"]
     body, body_err = await read_bounded_json(request)
@@ -9117,6 +9232,19 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
     skip_running = body.get("skip_running", True)
     if not isinstance(skip_running, bool):
         return web.json_response({"error": "skip_running must be a boolean"}, status=400)
+    # None means "leave each slot's effort alone"; a string is a level to apply.
+    effort = body.get("reasoning_effort")
+    if effort is not None:
+        valid_efforts = get_reasoning_effort_values()
+        if not isinstance(effort, str) or effort not in valid_efforts:
+            return web.json_response(
+                {
+                    "error": "reasoning_effort must be one of: "
+                    + ", ".join(sorted(valid_efforts - {""})),
+                    "code": "invalid_reasoning_effort",
+                },
+                status=400,
+            )
     # Deny-by-default (security-controls): the auth middleware always sets
     # request["app"] on every authenticated path (empty string for dashboard
     # users, app name for app tokens). An ABSENT key means the middleware did
@@ -9195,9 +9323,26 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
                 # does not get to switch the model a channel thread runs on.
                 # Skipped silently, like every other slot the app does not own.
                 continue
-            if slot.model == model_name:
-                # The MODEL is unchanged; the routing choice may not be. A slot
-                # already on this model but routed per turn is a slot whose turns
+            model_changes = slot.model != model_name
+            effort_changes = effort is not None and slot.reasoning_effort != effort
+            if effort_changes and slot.is_remote:
+                # A remote-bound slot's effort is the PEER's to run: the
+                # single-slot handler relays the pick through _apply_remote_pick,
+                # and this bulk path has no relay, so writing the local mirror
+                # would advertise a level the peer never applies. The effort is
+                # left untouched; the model keeps the pre-existing bulk
+                # behaviour for remote slots (the same relay gap, not widened
+                # here). When nothing else is asked of the slot it is reported
+                # as skipped, not unchanged: its effort was requested and not
+                # applied.
+                effort_changes = False
+                if not model_changes:
+                    skipped_running.append(name)
+                    continue
+            if not model_changes and not effort_changes:
+                # The model and any requested effort are unchanged; the routing
+                # choice may not be. A slot already on this model but routed per
+                # turn is a slot whose turns
                 # would still be moved off it, so the flag is cleared here as well
                 # -- otherwise the one case where the bulk switch reports "nothing
                 # to do" is the one case where it silently did nothing at all.
@@ -9208,6 +9353,31 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
                     slot.jev_route = False
                     routing_cleared = True
                 unchanged.append(name)
+                continue
+            if not model_changes:
+                # Effort-only: the model already serves this transcript, so
+                # nothing needs a reset. The children guard and the reset
+                # ladder below protect a teardown that does not happen here.
+                assert effort is not None  # effort_changes implies a requested level
+                outcome = await _bulk_effort_only_switch(
+                    state, slot, name, session_key, effort, skip_running=skip_running
+                )
+                if outcome == "skipped":
+                    skipped_running.append(name)
+                    continue
+                if outcome == "failed":
+                    failed.append(name)
+                    continue
+                # Committed after the push, like the single-slot handler. A
+                # rebind during the push is committed too: the push landed and
+                # (kiro) persisted the overlay, which cannot be unwound, and
+                # the slot value is what the new binding's next cold start
+                # reads. An explicit pick of this model as well, so the routing
+                # flag clears exactly as it does on the unchanged branch.
+                slot.reasoning_effort = effort
+                slot.jev_route = False
+                slot._dirty = True
+                switched.append(name)
                 continue
             # Children guard (api_chat_slot_reload's): the reset tears down the
             # runtime attached sub-agents run on, so a parent with children
@@ -9300,15 +9470,24 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
                 # after the reset); report it as skipped so the caller retries.
                 skipped_running.append(name)
                 continue
+            # Only a model change reaches this point (the effort-only path
+            # committed and continued above), so the pick generation bumps
+            # unconditionally: the same bump as the single-slot pick.
             slot.model = model_name
-            # Explicit pick (bulk): same generation bump as the single-slot pick.
             slot._model_pick_gen += 1
+            if effort_changes and effort is not None:
+                # Committed with the model, after the reset: the session that
+                # held the old effort is gone, and the next cold start reads
+                # this value as its override (ConfigLoader's
+                # ``reasoning_effort_override or default``).
+                slot.reasoning_effort = effort
             # And the same clearing of the routing choice. This surface takes no
             # "Auto (Jev)" target -- it switches many sessions to one model, which
             # is the opposite of a per-turn tier -- but it is an explicit pick, so
             # leaving the flag set would route the next turn away from the model
             # the owner just chose for this slot.
             slot.jev_route = False
+            slot._dirty = True
             _broadcast_context_reset(state, slot.key, None)
             switched.append(name)
 
