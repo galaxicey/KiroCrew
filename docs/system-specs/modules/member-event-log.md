@@ -179,7 +179,23 @@ durably creates `.legacy-activity-folded` inside the fenced unit directory befor
 retiring the source files by rename; the binding and rules sources remain because
 their own events gate re-import. `api_members` reconciles the folded roster against
 the agents config on read, so a hand edit becomes one `member/config` event with the
-fields that differed. It reconciles the roster's `last_message` the same way
+fields that differed. That correction is written through
+`append_closer_if_still_applies` with `_config_is_still_live_at`: the read loads the
+agents config ONCE and projects every row from it, so a save landing after that load
+writes the config files and appends its own `member/config`, leaving the fold NEWER
+than the config the read still holds. The caller therefore stamps the config files it
+read (`_config_fingerprint`) and hands the stamp to `reconcile_member_config`, which
+re-compares it under the per-slug write lock and writes nothing when the files have
+moved — the roster fold is last-wins per field, so appending the older values would
+regress the projection durably. The projection cannot answer this question: by the
+time the comparison is made the fold already shows the saved value, which is what
+made the two differ. The stamp covers both config files as a pair rather than one
+member, so an edit to any member refuses this one's correction too; that is the safe
+direction, because a refusal skips one correction the next read makes again while a
+wrong acceptance is permanent. The startup sweep stamps at its own entry, which bounds
+its own duration — the config it reconciles against was read by its caller, so a save
+landing before the sweep starts is outside what that stamp can see.
+It reconciles the roster's `last_message` the same way
 (`eventlog_hooks.reconcile_member_preview`): the transcript's speech-only read is the
 authority, so a fold still quoting a machinery preview written before the preview
 became speech-only gets one correcting `member/message` — carrying the empty string
